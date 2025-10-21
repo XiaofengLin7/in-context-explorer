@@ -188,17 +188,27 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
                     obs_key="text_obs",
                     action_key="action")
             
+        prompt_type = self.config.env.get('prompt_type', 'vanilla')    
+        if prompt_type == 'summary':
+            prompt_init = ALFWORLD_TEMPLATE_NO_HIS_SUMMARY
+            prompt_history = ALFWORLD_TEMPLATE_SUMMARY
+        elif prompt_type == 'vanilla':
+            prompt_init = ALFWORLD_TEMPLATE_NO_HIS
+            prompt_history = ALFWORLD_TEMPLATE
+        else:
+            raise ValueError(f"Invalid prompt type: {self.config.env.prompt_type}")
+
         for i in range(len(text_obs)):
             # exclude 'help' in admissible_actions[i]
             reformatted_admissible_actions = "\n ".join(f"'{s}'" for s in admissible_actions[i] if s != 'help')
 
             if init or self.config.env.history_length <= 0:
-                obs = ALFWORLD_TEMPLATE_NO_HIS_SUMMARY.format(
+                obs = prompt_init.format(
                     current_observation=text_obs[i],
                     admissible_actions=reformatted_admissible_actions
                 )
             else:
-                obs = ALFWORLD_TEMPLATE_SUMMARY.format(
+                obs = prompt_history.format(
                     task_description=self.tasks[i],
                     step_count=len(self.memory[i]),
                     history_length=valid_lens[i],

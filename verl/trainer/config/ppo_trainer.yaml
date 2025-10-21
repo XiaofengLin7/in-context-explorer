@@ -290,6 +290,8 @@ env:
   seed: 0
   max_steps: 50
   history_length: 2
+  success_coef: 30.0
+  prompt_type: summary
   resources_per_worker: # resources for each env worker
     num_cpus: 0.1
     num_gpus: 0

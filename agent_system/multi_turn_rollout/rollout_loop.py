@@ -405,17 +405,16 @@ class TrajectoryCollector:
         # Apply ALFWorld-specific trajectory reward shaping if applicable:
         # desired: episode_reward = -T + 30 * I_success
         # where T is episode_lengths, I_success is 1.0 if success else 0.0
-        try:
+        success_coef = float(getattr(self.config.env, "success_coef", 30.0))
+        if success_coef != 0.0:
             if "alfworld" in self.config.env.env_name.lower():
                 success_rate = success.get("success_rate")
                 if success_rate is not None:
                     # ensure numpy arrays
                     success_indicator = np.array(success_rate, dtype=np.float32)
                     T = np.array(episode_lengths, dtype=np.float32)
-                    episode_rewards = -T + 30.0 * success_indicator
-        except Exception as _:
-            # keep original rewards on any unexpected issue
-            pass
+                    episode_rewards = -T + success_coef * success_indicator
+
 
         return total_batch_list, episode_rewards, episode_lengths, success, traj_uid, tool_callings
     
