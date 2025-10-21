@@ -58,6 +58,7 @@ python3 -m verl.trainer.main_ppo \
     env.success_coef=10.0 \
     env.max_steps=50 \
     env.rollout.n=$group_size \
+    env.history_length=4 \
     env.resources_per_worker.num_cpus=$num_cpus_per_env_worker \
     trainer.critic_warmup=0 \
     trainer.logger=['console','wandb'] \
