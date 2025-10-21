@@ -1,6 +1,4 @@
 #!/bin/bash
-conda activate verl-agent-webshop
-export PIP_CACHE_DIR=/usr3/graduate/xfl/lab/.pip_cache
 
 # Displays information on how to use script
 helpFunction()

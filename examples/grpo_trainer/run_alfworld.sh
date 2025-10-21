@@ -1,6 +1,6 @@
 set -x
-ALFWORLD_DATA=/projectnb/replearn/xfl/alfworld/data_storage
-N_GPUS=4
+export ALFWORLD_DATA=/projectnb/replearn/xfl/alfworld/data_storage
+N_GPUS=2
 ENGINE=${1:-vllm}
 export VLLM_ATTENTION_BACKEND=FLASH_ATTN
 
@@ -54,6 +54,8 @@ python3 -m verl.trainer.main_ppo \
     algorithm.use_kl_in_reward=False \
     env.env_name=alfworld/AlfredTWEnv \
     env.seed=0 \
+    env.prompt_type=summary \
+    env.success_coef=10.0 \
     env.max_steps=50 \
     env.rollout.n=$group_size \
     env.resources_per_worker.num_cpus=$num_cpus_per_env_worker \
