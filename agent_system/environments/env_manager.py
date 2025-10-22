@@ -23,6 +23,7 @@ from agent_system.environments.prompts import *
 from agent_system.environments.base import EnvironmentManagerBase, to_numpy
 from agent_system.memory import SimpleMemory, SearchMemory
 from omegaconf import OmegaConf
+import re
 
 def parse_gamefile(infos):
     gamefile = []
@@ -133,6 +134,17 @@ class SearchEnvironmentManager(EnvironmentManagerBase):
 class AlfWorldEnvironmentManager(EnvironmentManagerBase):
     def __init__(self, envs, projection_f, config):
         self.memory = SimpleMemory()
+        prompt_type = config.env.get('prompt_type', 'vanilla')    
+        if prompt_type == 'summary':
+            self.prompt_init = ALFWORLD_TEMPLATE_NO_HIS_SUMMARY
+            self.prompt_history = ALFWORLD_TEMPLATE_SUMMARY
+            self.keep_known_and_unknown = True
+        elif prompt_type == 'vanilla':
+            self.prompt_init = ALFWORLD_TEMPLATE_NO_HIS
+            self.prompt_history = ALFWORLD_TEMPLATE
+            self.keep_known_and_unknown = False
+        else:
+            raise ValueError(f"Invalid prompt type: {config.env.prompt_type}")
         super().__init__(envs, projection_f, config)
     
     def reset(self, kwargs):
@@ -152,8 +164,12 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
         text_obs, image_obs, rewards, dones, infos = self.envs.step(actions)
         self.memory.store({'text_obs': self.pre_text_obs, 'action': actions})
         self.pre_text_obs = text_obs
+        if self.keep_known_and_unknown:
+            known_information, unknown_information = self.extract_known_and_unknown(text_actions)
+            full_text_obs = self.build_text_obs_with_known_and_unknown(text_obs, self.envs.get_admissible_commands, known_information, unknown_information)
+        else:
+            full_text_obs = self.build_text_obs(text_obs, self.envs.get_admissible_commands)
 
-        full_text_obs = self.build_text_obs(text_obs, self.envs.get_admissible_commands)
         if infos[0].get("extra.gamefile") is None:
             infos = set_gamefile(infos, self.gamefile)
 
@@ -175,7 +191,40 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
                 self.tasks.append(obs[task_start + len('Your task is to: '):].strip())
             else:
                 raise ValueError("Task description not found in text observation.")
-        
+    
+    def extract_known_and_unknown(self, responses: List[str]) -> Tuple[List[str], List[str]]:
+        """
+        Extract known and unknown information from text actions.
+
+        The function searches for information enclosed within <known>...</known> and <unknown>...</unknown>
+        tags, making sure these are also within <think>...</think> tags, as required by the protocol.
+
+        Args:
+            responses (List[str]): List of agent responses containing required tags.
+
+        Returns:
+            known_information (List[str]): List of extracted known information strings.
+            unknown_information (List[str]): List of extracted unknown information strings.
+        """
+        known_information: List[str] = []
+        unknown_information: List[str] = []
+
+        for response in responses:
+            # Search for content within <think>...</think>
+            think_match = re.search(r"<think>(.*?)</think>", response, re.DOTALL | re.IGNORECASE)
+            if not think_match:
+                known_information.append("")
+                unknown_information.append("")
+                continue
+            think_content = think_match.group(1)
+
+            # Since we assume exactly one <known> and <unknown> per response, use search instead of findall
+            known_match = re.search(r"<known>(.*?)</known>", think_content, re.DOTALL | re.IGNORECASE)
+            unknown_match = re.search(r"<unknown>(.*?)</unknown>", think_content, re.DOTALL | re.IGNORECASE)
+            known_information.append(known_match.group(1).strip() if known_match else "")
+            unknown_information.append(unknown_match.group(1).strip() if unknown_match else "")
+
+        return known_information, unknown_information
 
     def build_text_obs(self, text_obs: List[str], admissible_actions: List[List[str]], init: bool = False) -> List[str]:
         """
@@ -187,32 +236,55 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
                     self.config.env.history_length,
                     obs_key="text_obs",
                     action_key="action")
-            
-        prompt_type = self.config.env.get('prompt_type', 'vanilla')    
-        if prompt_type == 'summary':
-            prompt_init = ALFWORLD_TEMPLATE_NO_HIS_SUMMARY
-            prompt_history = ALFWORLD_TEMPLATE_SUMMARY
-        elif prompt_type == 'vanilla':
-            prompt_init = ALFWORLD_TEMPLATE_NO_HIS
-            prompt_history = ALFWORLD_TEMPLATE
-        else:
-            raise ValueError(f"Invalid prompt type: {self.config.env.prompt_type}")
 
         for i in range(len(text_obs)):
             # exclude 'help' in admissible_actions[i]
             reformatted_admissible_actions = "\n ".join(f"'{s}'" for s in admissible_actions[i] if s != 'help')
 
             if init or self.config.env.history_length <= 0:
-                obs = prompt_init.format(
+                obs = self.prompt_init.format(
                     current_observation=text_obs[i],
                     admissible_actions=reformatted_admissible_actions
                 )
             else:
-                obs = prompt_history.format(
+                obs = self.prompt_history.format(
                     task_description=self.tasks[i],
                     step_count=len(self.memory[i]),
                     history_length=valid_lens[i],
                     action_history=memory_contexts[i],
+                    current_step=len(self.memory[i]) + 1,
+                    current_observation=text_obs[i],
+                    admissible_actions=reformatted_admissible_actions
+                )
+
+            postprocess_text_obs.append(obs)
+        return postprocess_text_obs
+    
+    def build_text_obs_with_known_and_unknown(self, text_obs: List[str], admissible_actions: List[List[str]], known_information: List[str], unknown_information: List[str]) -> List[str]:
+        postprocess_text_obs = []
+        if self.config.env.history_length > 0:
+            memory_contexts, valid_lens = self.memory.fetch(
+                    self.config.env.history_length,
+                    obs_key="text_obs",
+                    action_key="action")
+
+        for i in range(len(text_obs)):
+            # exclude 'help' in admissible_actions[i]
+            reformatted_admissible_actions = "\n ".join(f"'{s}'" for s in admissible_actions[i] if s != 'help')
+
+            if self.config.env.history_length <= 0:
+                obs = self.prompt_init.format(
+                    current_observation=text_obs[i],
+                    admissible_actions=reformatted_admissible_actions
+                )
+            else:
+                obs = self.prompt_history.format(
+                    task_description=self.tasks[i],
+                    step_count=len(self.memory[i]),
+                    history_length=valid_lens[i],
+                    action_history=memory_contexts[i],
+                    known_information=known_information[i],
+                    unknown_information=unknown_information[i],
                     current_step=len(self.memory[i]) + 1,
                     current_observation=text_obs[i],
                     admissible_actions=reformatted_admissible_actions

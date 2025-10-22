@@ -1,6 +1,6 @@
 set -x
 export ALFWORLD_DATA=/projectnb/replearn/xfl/alfworld/data_storage
-N_GPUS=2
+N_GPUS=4
 ENGINE=${1:-vllm}
 export VLLM_ATTENTION_BACKEND=FLASH_ATTN
 
@@ -9,7 +9,9 @@ num_cpus_per_env_worker=0.1 # The CPU resource allocated for each environment wo
 train_data_size=16
 val_data_size=128
 group_size=8
-
+success_coef=30.0
+prompt_type=summary
+experiment_name=grpo_qwen2.5_1.5b_success_coef_${success_coef}_prompt_type_${prompt_type}
 # We only use data preparation to indicate the modality and the data size.
 python3 -m examples.data_preprocess.prepare \
     --mode 'text' \
@@ -54,8 +56,8 @@ python3 -m verl.trainer.main_ppo \
     algorithm.use_kl_in_reward=False \
     env.env_name=alfworld/AlfredTWEnv \
     env.seed=0 \
-    env.prompt_type=summary \
-    env.success_coef=10.0 \
+    env.prompt_type=$prompt_type \
+    env.success_coef=$success_coef \
     env.max_steps=50 \
     env.rollout.n=$group_size \
     env.history_length=4 \
@@ -63,10 +65,10 @@ python3 -m verl.trainer.main_ppo \
     trainer.critic_warmup=0 \
     trainer.logger=['console','wandb'] \
     trainer.project_name='verl_agent_alfworld' \
-    trainer.experiment_name='grpo_qwen2.5_1.5b' \
+    trainer.experiment_name=$experiment_name \
     trainer.n_gpus_per_node=$N_GPUS \
     trainer.nnodes=1 \
     trainer.save_freq=-1 \
     trainer.test_freq=5 \
     trainer.total_epochs=150 \
-    trainer.val_before_train=False $@
+    trainer.val_before_train=True $@
