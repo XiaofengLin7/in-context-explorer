@@ -49,11 +49,13 @@ Once you've finished your reasoning, you should choose an admissible action for 
 ALFWORLD_TEMPLATE_SUMMARY = """
 You are an expert agent operating in the ALFRED Embodied Environment. Your task is to: {task_description}
 Prior to this step, you have already taken {step_count} step(s). Below are the most recent {history_length} observations and the corresponding actions you took: {action_history}
+Your known information is from the previous step: <known>{known_information}</known>
+Your unknown information is from the previous step: <unknown>{unknown_information}</unknown>
 You are now at step {current_step} and your current observation is: {current_observation}
 Your admissible actions of the current situation are: [{admissible_actions}].
 
 Now it's your turn to take an action.
-You should first reason step-by-step about the current situation. This reasoning process MUST be enclosed within <think> </think> tags. 
-Based on the task description, within your reasoning process, you should first summarize what is known and what is unknown about the current situation. The known MUST be enclosed within <known> </known> tags. The unknown MUST be enclosed within <unknown> </unknown> tags.
+You should reason step-by-step about the current situation before taking an action. This reasoning process MUST be enclosed within <think> </think> tags. 
+Within your reasoning process, you should first summarize what is known and what is unknown about the current situation. The known MUST be enclosed within <known> </known> tags. The unknown MUST be enclosed within <unknown> </unknown> tags. You MUST include the known and unknown within <think> </think> tags.
 Once you've finished your reasoning, you should choose an admissible action for current step and present it within <action> </action> tags.
 """
