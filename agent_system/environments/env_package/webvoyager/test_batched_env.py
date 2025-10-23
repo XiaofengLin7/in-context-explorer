@@ -1,6 +1,3 @@
-
-
-
 from agent_system.environments.env_package.webvoyager import build_webvoyager_envs, webvoyager_projection
 env_kwargs = {}
 _envs = build_webvoyager_envs(config.env.seed, config.data.train_batch_size, group_n, is_train=True, env_kwargs=env_kwargs, resources_per_worker=resources_per_worker)
