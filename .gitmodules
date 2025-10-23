@@ -1,3 +1,4 @@
 [submodule "agent_system/environments/env_package/webvoyager/webvoyager"]
 	path = agent_system/environments/env_package/webvoyager/webvoyager
-	url = https://github.com/MinorJerry/WebVoyager.git
+	url = git@github.com:XiaofengLin7/WebVoyager.git
+	branch = main
