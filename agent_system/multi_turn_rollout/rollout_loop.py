@@ -74,23 +74,36 @@ class TrajectoryCollector:
 
         _obs_anchor = torch_to_numpy(obs_anchor, is_object=True) if isinstance(obs_anchor, torch.Tensor) else obs_anchor
 
-        # Build chat structure
-        # obs_content = raw_prompt[0]['content']
-        # if '<image>' in obs_content: 
-        #     obs_content = obs_content.replace('<image>', '')
-
-        # Build chat structure
-        obs_content = ''
-        if obs_text is not None:
-            obs_content += obs_text
+        # Build chat structure supporting two formats:
+        # 1) Chat-style list of messages with text/image blocks
+        # 2) Plain string with optional <image> placeholders
+        images_from_chat: List = []
+        if isinstance(obs_text, list):
+            chat = []
+            for msg in obs_text:
+                role = msg.get('role', 'user')
+                content_blocks = msg.get('content', [])
+                text_acc = ''
+                if isinstance(content_blocks, list):
+                    for block in content_blocks:
+                        if isinstance(block, dict) and block.get('type') == 'text':
+                            text_acc += block.get('text', '')
+                        elif isinstance(block, dict) and block.get('type') == 'image':
+                            src = block.get('source', {})
+                            if isinstance(src, dict) and src.get('type') == 'path' and src.get('path'):
+                                images_from_chat.append(src.get('path'))
+                                text_acc += "\n<image>"
+                chat.append({"role": role, "content": text_acc})
         else:
-            print(f"Warning: No text observation found!")
-
-        
-        chat = np.array([{
-            "content": obs_content,
-            "role": "user",
-        }])
+            obs_content = ''
+            if obs_text is not None:
+                obs_content += obs_text
+            else:
+                print(f"Warning: No text observation found!")
+            chat = [{
+                "content": obs_content,
+                "role": "user",
+            }]
         
         # Apply chat template
         prompt_with_chat_template = self.tokenizer.apply_chat_template(
@@ -102,11 +115,28 @@ class TrajectoryCollector:
         # Initialize return dict
         row_dict = {}
         
-        # Process multimodal data
+        # Process multimodal data (support multi-image and chat-derived images)
+        # Determine image list
+        images_list = []
+        if isinstance(obs_text, list):
+            images_list = images_from_chat
+        else:
+            if isinstance(obs_image, list):
+                images_list = obs_image
+            elif obs_image is not None:
+                images_list = [obs_image]
+
+        is_multi_modal = len(images_list) > 0
+
         if is_multi_modal:
+            # Ensure the number of <image> placeholders matches images_list length
+            placeholder_count = prompt_with_chat_template.count('<image>')
+            if len(images_list) > placeholder_count:
+                prompt_with_chat_template = prompt_with_chat_template + ("\n" + "\n".join(["<image>"] * (len(images_list) - placeholder_count)))
+
             # Replace image placeholder with vision tokens
             raw_prompt = prompt_with_chat_template.replace('<image>', '<|vision_start|><|image_pad|><|vision_end|>')
-            row_dict['multi_modal_data'] = {'image': [process_image(obs_image)]}
+            row_dict['multi_modal_data'] = {'image': [process_image(img) for img in images_list]}
             image_inputs = self.processor.image_processor(row_dict['multi_modal_data']['image'], return_tensors='pt')
             image_grid_thw = image_inputs['image_grid_thw']
             row_dict['multi_modal_inputs'] = {key: val for key, val in image_inputs.items()}
@@ -115,16 +145,11 @@ class TrajectoryCollector:
                 index = 0
                 while '<image>' in prompt_with_chat_template:
                     prompt_with_chat_template = prompt_with_chat_template.replace(
-                        '<image>',
-                        '<|vision_start|>' + '<|placeholder|>' * (image_grid_thw[index].prod() // merge_length) +
-                        '<|vision_end|>',
+                        '<image>', '<|vision_start|>' + '<|placeholder|>' * (image_grid_thw[index].prod() // merge_length) + '<|vision_end|>',
                         1,
                     )
                     index += 1
-
-                prompt_with_chat_template = prompt_with_chat_template.replace('<|placeholder|>',
-                                                                                self.processor.image_token)
-
+                prompt_with_chat_template = prompt_with_chat_template.replace('<|placeholder|>', self.processor.image_token)
         else:
             raw_prompt = prompt_with_chat_template
         
