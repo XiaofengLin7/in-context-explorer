@@ -160,12 +160,14 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
         return {'text': full_text_obs, 'image': image_obs, 'anchor': text_obs}, infos
     
     def step(self, text_actions: List[str]):
+        # extract known and unkown here as text_actions will be mutated in place in  self.projection_f
+        if self.keep_known_and_unknown:
+            known_information, unknown_information = self.extract_known_and_unknown(text_actions)
         actions, valids = self.projection_f(text_actions, self.envs.get_admissible_commands)
         text_obs, image_obs, rewards, dones, infos = self.envs.step(actions)
         self.memory.store({'text_obs': self.pre_text_obs, 'action': actions})
         self.pre_text_obs = text_obs
         if self.keep_known_and_unknown:
-            known_information, unknown_information = self.extract_known_and_unknown(text_actions)
             full_text_obs = self.build_text_obs_with_known_and_unknown(text_obs, self.envs.get_admissible_commands, known_information, unknown_information)
         else:
             full_text_obs = self.build_text_obs(text_obs, self.envs.get_admissible_commands)
@@ -198,6 +200,9 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
 
         The function searches for information enclosed within <known>...</known> and <unknown>...</unknown>
         tags, making sure these are also within <think>...</think> tags, as required by the protocol.
+        Robustly extract known/unknown from model outputs that either:
+        (a) use <known>/<unknown> inside <think>, or
+        (b) use 'Known ...:' / 'Unknown ...:' headers inside <think>.
 
         Args:
             responses (List[str]): List of agent responses containing required tags.
@@ -208,6 +213,18 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
         """
         known_information: List[str] = []
         unknown_information: List[str] = []
+
+        def _extract_by_headers(inside: str) -> Tuple[str, str]:
+            # normalize "Known Information:" / "Known -"/"Known —" → "Known:"
+            norm = re.sub(r"(?i)\b(known|unknown)\s*(information)?\s*[-–—]?\s*:", r"\1:", inside)
+
+            flags = re.IGNORECASE | re.DOTALL | re.MULTILINE
+            known_m = re.search(r"^\s*Known\s*:\s*(.*?)(?=^\s*Unknown\s*:|\Z)", norm, flags)
+            unknown_m = re.search(r"^\s*Unknown\s*:\s*(.*?)(?=^\s*[A-Z][^\n]*:|\Z)", norm, flags)
+
+            known = known_m.group(1).strip() if known_m else ""
+            unknown = unknown_m.group(1).strip() if unknown_m else ""
+            return known, unknown
 
         for response in responses:
             # Search for content within <think>...</think>
@@ -221,10 +238,19 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
             # Since we assume exactly one <known> and <unknown> per response, use search instead of findall
             known_match = re.search(r"<known>(.*?)</known>", think_content, re.DOTALL | re.IGNORECASE)
             unknown_match = re.search(r"<unknown>(.*?)</unknown>", think_content, re.DOTALL | re.IGNORECASE)
-            known_information.append(known_match.group(1).strip() if known_match else "")
-            unknown_information.append(unknown_match.group(1).strip() if unknown_match else "")
+
+            known = known_match.group(1).strip() if known_match else ""
+            unknown = unknown_match.group(1).strip() if unknown_match else ""
+
+            # 2) fallback: header-style "Known:" / "Unknown:" inside <think>
+            if not known and not unknown:
+                known, unknown = _extract_by_headers(think_content)
+
+            known_information.append(known)
+            unknown_information.append(unknown)
 
         return known_information, unknown_information
+
 
     def build_text_obs(self, text_obs: List[str], admissible_actions: List[List[str]], init: bool = False) -> List[str]:
         """
