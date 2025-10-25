@@ -5,7 +5,7 @@ import numpy as np
 
 class WebvoyagerWorker:
     def __init__(self, seed, env_kwargs):
-        from .webvoyager.webgym import WebVoyagerEnv
+        from .webgym import WebVoyagerEnv
         self.env = WebVoyagerEnv(
                     api_key="your-api-key-here",
                     headless=True,
