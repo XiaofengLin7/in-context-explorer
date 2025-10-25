@@ -1,5 +1,17 @@
 ## Installation
 Please refer to README-verl-agent.md
+### Appworld
+```
+conda create -n verl-agent-appworld python=3.12 -y
+conda activate verl-agent-appworld
+pip install git+https://github.com/StonyBrookNLP/appworld.git
+appworld install
+appworld download data
+pip3 install torch==2.6.0 --index-url https://download.pytorch.org/whl/cu124
+pip3 install flash-attn==2.7.4.post1 --no-build-isolation
+pip3 install -e .
+pip3 install vllm==0.8.5
+```
 ## Experiments
 ### Training scripts
 configure your ALFWORLD_DATA first and your desired number of gpus in this training script first.
