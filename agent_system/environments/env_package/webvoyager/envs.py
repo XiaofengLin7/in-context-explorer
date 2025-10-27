@@ -4,22 +4,27 @@ import numpy as np
 
 
 class WebvoyagerWorker:
-    def __init__(self, seed, env_kwargs):
-        from .webgym import WebVoyagerEnv
+    def __init__(self, seed, data_file, env_kwargs):
+        from webgym import WebVoyagerEnv
         self.env = WebVoyagerEnv(
                     api_key="your-api-key-here",
                     headless=True,
                     text_only=True
                 )
-    
+        self.data_file = data_file
+        self.tasks = []
+        with open(self.data_file, 'r', encoding='utf-8') as f:
+            for line in f:
+                self.tasks.append(json.loads(line))
+
     def step(self, action):
         """Execute a step in the environment"""
         obs, reward, done, info = self.env.step(action)
-        info = dict(info or {})  # make a *copy* so we can mutate safely
+        
+        #info = dict(info or {})  # make a *copy* so we can mutate safely
         #info['available_actions'] = self.env.get_available_actions()
         #info['task_score'] = reward
 
-        # Option: personalize reward.
         #if done and reward == 1.0:
         #    info['won'] = True
         #    reward = 10.0
@@ -29,8 +34,9 @@ class WebvoyagerWorker:
 
         return obs, reward, done, info
     
-    def reset(self, task):
+    def reset(self, idx):
         """Reset the environment with given a task dict"""
+        task = self.tasks[idx]
         obs, info = self.env.reset(task=task)
         #info = dict(info or {})
         #info['available_actions'] = self.env.get_available_actions()
@@ -45,10 +51,6 @@ class WebvoyagerWorker:
     def get_available_actions(self):
         """Get available actions"""
         return self.env.get_available_actions()
-    
-    def get_goals(self):
-        """Get environment goals"""
-        return self.env.server.goals
     
     def close(self):
         """Close the environment"""
@@ -91,40 +93,29 @@ class WebvoyagerMultiProcessEnv(gym.Env):
 
         self._env_kwargs = env_kwargs if env_kwargs is not None else {'observation_mode': 'text', 'num_products': None}
 
+        # deal with dataset
+        # TODO: shuffule and iterate the dataset
+        if self.is_train:
+            self.data_file = "/projectnb/noc-lab/ylchen/data/webvoyager/webvoyager_train_data.jsonl"
+        else:
+            self.data_file = "/projectnb/noc-lab/ylchen/data/webvoyager/webvoyager_test_data.jsonl"
+        data_size = sum(1 for _ in open(self.data_file, "r"))
+        self.task_idxs = range(data_size)
+
         # -------------------------- Ray actors setup --------------------------
         env_worker = ray.remote(**resources_per_worker)(WebvoyagerWorker)
         self._workers = []
         for i in range(self.num_processes):
-            worker = env_worker.remote(seed + (i // self.group_n), self._env_kwargs)
+            worker = env_worker.remote(seed + (i // self.group_n), self.data_file, self._env_kwargs)
             self._workers.append(worker)
 
-        # Get goals from the first worker
-        goals_future = self._workers[0].get_goals.remote()
-        goals = ray.get(goals_future)
-
-        # ------- original ----------#
-        # if args.num is None:
-        #     if split == 'test':
-        #         self.goal_idxs = range(500)
-        #     elif split == 'eval':
-        #         self.goal_idxs = range(500, 1500)
-        #     elif split == 'train':
-        #         self.goal_idxs = range(1500, len(self.env.server.goals))
-        # else:
-        #     self.goal_idxs = range(len(self.env.server.goals))
-
-        if not self.is_train:
-            self.goal_idxs = range(500)
-        else:
-            self.goal_idxs = range(500, len(goals))
-            
-        print(self.goal_idxs)
 
     # ------------------------------------------------------------------
     # Base API ----------------------------------------------------------
     # ------------------------------------------------------------------
 
-    def step(self, actions: list[str]):
+    def step(self, actions: list):
+        # TODO: take care of the action formulation, action_key, and info (depends on action key)
         if len(actions) != self.num_processes:
             raise ValueError(
                 f'Expected {self.num_processes} actions, got {len(actions)}',
@@ -148,7 +139,7 @@ class WebvoyagerMultiProcessEnv(gym.Env):
         return obs_list, reward_list, done_list, info_list
 
     def reset(self):
-        idx = self._rng.choice(self.goal_idxs, size=self.env_num, replace=False)
+        idx = self._rng.choice(self.task_idxs, size=self.env_num, replace=False)
         idx = np.repeat(idx, self.group_n).tolist()
 
         # Send reset commands to all workers
