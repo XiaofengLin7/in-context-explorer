@@ -691,6 +691,7 @@ class RayPPOTrainer:
         data_source_lst = []
         tool_calling_list = []
         traj_uid_list = []
+        episode_length_list = []
         success_rate_dict = {}
 
         # Lists to collect samples for the table
@@ -772,6 +773,8 @@ class RayPPOTrainer:
             data_source_lst.append(test_batch.non_tensor_batch.get('data_source', ['unknown'] * reward_tensor.shape[0]))
             tool_calling_list.append(test_output_gen_batch.non_tensor_batch['tool_callings'])
             traj_uid_list.append(test_output_gen_batch.non_tensor_batch['traj_uid'])
+            if 'episode_lengths' in test_output_gen_batch.non_tensor_batch:
+                episode_length_list.append(test_output_gen_batch.non_tensor_batch['episode_lengths'])
             # success rate
             for k in test_batch.non_tensor_batch.keys():
                 if 'success_rate' in k:
@@ -789,6 +792,9 @@ class RayPPOTrainer:
         tool_callings = np.concatenate(tool_calling_list, axis=0)
         traj_uids = np.concatenate(traj_uid_list, axis=0)
         success_rate = {k: np.mean(v) for k, v in success_rate_dict.items()}
+        episode_lengths = None
+        if len(episode_length_list) > 0:
+            episode_lengths = np.concatenate(episode_length_list, axis=0)
 
         # evaluate test_score based on data source
         data_source_reward = {}
@@ -822,6 +828,12 @@ class RayPPOTrainer:
 
         for k, v in success_rate.items():
             metric_dict[f'val/{k}'] = v
+
+        # Log a single scalar for validation episode length averaged over unique trajectories
+        if episode_lengths is not None:
+            metric_dict['val/episode_length/mean'] = float(np.mean(episode_lengths[unique_idx]))
+            metric_dict['val/episode_length/max'] = float(np.max(episode_lengths[unique_idx]))
+            metric_dict['val/episode_length/min'] = float(np.min(episode_lengths[unique_idx]))
 
         return metric_dict
 
