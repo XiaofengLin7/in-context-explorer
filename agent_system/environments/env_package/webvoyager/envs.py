@@ -1,9 +1,18 @@
 import ray
 import gym
 import numpy as np
+import json
+import os
+import yaml
+from pprint import pprint
 
+def load_config_file(path):
+    assert os.path.exists(path), "Invalid config file"
+    with open(path) as reader:
+        config = yaml.safe_load(reader)
+    return config
 
-class WebvoyagerWorker:
+class WebVoyagerWorker:
     def __init__(self, seed, data_file, env_kwargs):
         from webgym import WebVoyagerEnv
         self.env = WebVoyagerEnv(
@@ -61,7 +70,7 @@ class WebvoyagerWorker:
 # Vectorised Ray environment --------------------------------------------------
 # -----------------------------------------------------------------------------
 
-class WebvoyagerMultiProcessEnv(gym.Env):
+class WebVoyagerMultiProcessEnv(gym.Env):
     """A vectorised, Ray-based wrapper around *WebAgentTextEnv*.
 
     ``info`` dictionaries returned by :py:meth:`step` **and** :py:meth:`reset`
@@ -75,6 +84,7 @@ class WebvoyagerMultiProcessEnv(gym.Env):
         group_n: int,
         resources_per_worker: dict,
         is_train: bool = True,
+        config_path: str = "configs/configs.yaml",
         env_kwargs: dict = None,
     ) -> None:
         super().__init__()
@@ -88,17 +98,16 @@ class WebvoyagerMultiProcessEnv(gym.Env):
         self.num_processes = env_num * group_n
         self.is_train = is_train
         if not is_train: assert group_n == 1
-
+        self.config = load_config_file(config_path)
+        raw_path = self.config["dataset"]["train_data_path"] if is_train else self.config["dataset"]["test_data_path"]
+        # Expand environment variables like $WEBVOYAGER_DATA in the path
+        self.data_file = os.path.expandvars(raw_path)
         self._rng = np.random.RandomState(seed)
 
         self._env_kwargs = env_kwargs if env_kwargs is not None else {'observation_mode': 'text', 'num_products': None}
 
         # deal with dataset
         # TODO: shuffule and iterate the dataset
-        if self.is_train:
-            self.data_file = "/projectnb/noc-lab/ylchen/data/webvoyager/webvoyager_train_data.jsonl"
-        else:
-            self.data_file = "/projectnb/noc-lab/ylchen/data/webvoyager/webvoyager_test_data.jsonl"
         data_size = sum(1 for _ in open(self.data_file, "r"))
         self.task_idxs = range(data_size)
 
@@ -205,6 +214,7 @@ class WebvoyagerMultiProcessEnv(gym.Env):
 # -----------------------------------------------------------------------------
 
 def build_webvoyager_envs(
+    config_path: str,
     seed: int,
     env_num: int,
     group_n: int,
@@ -212,12 +222,47 @@ def build_webvoyager_envs(
     is_train: bool = True,
     env_kwargs: dict = None,
 ):
-    """Mirror *build_sokoban_envs* so higher‑level code can swap seamlessly."""
-    return WebvoyagerMultiProcessEnv(
+    """Mirror *build_webvoyager_envs* so higher‑level code can swap seamlessly."""
+    return WebVoyagerMultiProcessEnv(
         seed=seed,
         env_num=env_num,
         group_n=group_n,
         resources_per_worker=resources_per_worker,
         is_train=is_train,
+        config_path=config_path,
         env_kwargs=env_kwargs,
     )
+
+
+if __name__ == "__main__":
+    # Simple smoke test for the reset() function
+    # It will launch headless Chrome instances; ensure chromedriver is installed.
+    try:
+        # Point WEBVOYAGER_DATA to the bundled data directory for convenience
+        base_dir = os.path.dirname(__file__)
+        os.environ['WEBVOYAGER_DATA'] = '/usr3/graduate/xfl/lab/verl-agent/agent_system/environments/env_package/webvoyager/webvoyager/data'
+
+        env = WebVoyagerMultiProcessEnv(
+            seed=0,
+            env_num=1,
+            group_n=1,
+            resources_per_worker={"num_cpus": 1},
+            is_train=False,  # use the smaller test split from configs
+            config_path=os.path.join(base_dir, 'configs', 'configs.yaml'),
+            env_kwargs={
+                "headless": True,
+                "text_only": True,
+            },
+        )
+
+        obs_list, info_list = env.reset()
+        pprint(obs_list)
+        print("reset ok", len(obs_list))
+        if info_list:
+            print("info keys:", list(info_list[0].keys()))
+
+    finally:
+        try:
+            env.close()
+        except Exception:
+            pass
