@@ -1,0 +1,23 @@
+{
+    "$schema": "/export/content/granular/etc/mldev/v1/openconnect-config-schema.json",
+    "in-context-explorer": {
+        "registration": {
+            "project": "lifomo-${USER}-project",
+            "domain": "development",
+            "workflow_src": "workspace/src/workflows/workflow.py",
+            "resources": [
+                "scripts",
+                "src/in-context-explorer"
+            ],
+            "additional_sources": [],
+            "images": [
+            ]
+        },
+        "executions": [
+            {
+                "name": "alfworld",
+                "workflow_name": "workflows.workflow.alfworld_workflow"
+            }
+        ]
+    }
+}
