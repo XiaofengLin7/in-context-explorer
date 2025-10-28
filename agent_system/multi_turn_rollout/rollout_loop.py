@@ -26,6 +26,7 @@ from agent_system.multi_turn_rollout.utils import process_image, to_list_of_dict
 from agent_system.environments import EnvironmentManagerBase
 from typing import List, Dict
 from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
+from PIL import Image
 
 class TrajectoryCollector:
     def __init__(self, config, tokenizer: PreTrainedTokenizer, processor=None):
@@ -91,7 +92,8 @@ class TrajectoryCollector:
                         elif isinstance(block, dict) and block.get('type') == 'image':
                             src = block.get('source', {})
                             if isinstance(src, dict) and src.get('type') == 'path' and src.get('path'):
-                                images_from_chat.append(src.get('path'))
+                                _image = np.array(Image.open(src.get('path'))) # read the image
+                                images_from_chat.append(_image)
                                 text_acc += "\n<image>"
                 chat.append({"role": role, "content": text_acc})
         else:
@@ -200,8 +202,11 @@ class TrajectoryCollector:
         })
 
         if self.config.data.get('return_raw_chat', False):
-            row_dict['raw_prompt'] = chat.tolist()
-        
+            if not isinstance(chat, list):
+                row_dict['raw_prompt'] = chat.tolist()
+            else:
+                row_dict['raw_prompt'] = chat
+
         return row_dict
 
     def preprocess_batch(
