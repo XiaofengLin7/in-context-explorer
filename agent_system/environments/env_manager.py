@@ -632,12 +632,12 @@ class WebVoyagerEnvironmentManager(EnvironmentManagerBase):
         warns: List[Any] = []
         pdfs: List[Any] = []
         fails: List[Any] = []
-
+        
         for obs in obs_list:
-            task_goal = obs.get('task_question', '')
-            url = obs.get('task_url', '')
-            tree = obs.get('accessibility_tree', '')
-            img_path = obs.get('screenshot')
+            task_goal = obs.get('task_ques', '')
+            url = obs.get('starting_url', '')
+            tree = obs.get('ac_tree', '')
+            img_path = obs.get('image')
 
             init_text = WEBVOYAGER_PROMPT_TEMPLATE["initial"].format(
                 task_goal=task_goal,
@@ -693,10 +693,10 @@ class WebVoyagerEnvironmentManager(EnvironmentManagerBase):
         fails: List[Any] = []
 
         for obs in next_obs:
-            task_goal = obs.get('task_question', '')
-            url = obs.get('task_url', '')
-            tree = obs.get('accessibility_tree', '')
-            img_path = obs.get('screenshot')
+            task_goal = obs.get('task_ques', '')
+            url = obs.get('url', '') # current url
+            tree = obs.get('ac_tree', '')
+            img_path = obs.get('image')
             pdf_obs = obs.get('pdf_obs', '')
 
             if pdf_obs:
@@ -856,7 +856,7 @@ def make_envs(config):
         env_kwargs = {}
         config_path = os.path.join(os.path.dirname(__file__), 'env_package/webvoyager/configs/configs.yaml')
         _envs = build_webvoyager_envs(config_path, config.env.seed, config.data.train_batch_size, group_n, is_train=True, env_kwargs=env_kwargs, resources_per_worker=resources_per_worker)
-        _val_envs = build_webvoyager_envs(config_path, config.env.seed + 1000, config.data.val_batch_size, 1, is_train=False, env_kwargs=env_kwargs, resources_per_worker=resources_per_worker, config_path="configs/configs.yaml")
+        _val_envs = build_webvoyager_envs(config_path, config.env.seed + 1000, config.data.val_batch_size, 1, is_train=False, env_kwargs=env_kwargs, resources_per_worker=resources_per_worker)
         
         projection_f = partial(webvoyager_projection)
         envs = WebVoyagerEnvironmentManager(_envs, projection_f, config)
