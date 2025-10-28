@@ -402,12 +402,12 @@ class TrajectoryCollector:
                     episode_lengths=episode_lengths,
                     )
         
-        # Apply ALFWorld-specific trajectory reward shaping if applicable:
+        # Apply ALFWorld/WebShop-specific trajectory reward shaping if applicable:
         # desired: episode_reward = -T + 30 * I_success
         # where T is episode_lengths, I_success is 1.0 if success else 0.0
         success_coef = float(getattr(self.config.env, "success_coef", 30.0))
         if success_coef != 0.0:
-            if "alfworld" in self.config.env.env_name.lower():
+            if "alfworld" in self.config.env.env_name.lower() or "webshop" in self.config.env.env_name.lower():
                 success_rate = success.get("success_rate")
                 if success_rate is not None:
                     # ensure numpy arrays

@@ -25,6 +25,62 @@ from agent_system.memory import SimpleMemory, SearchMemory
 from omegaconf import OmegaConf
 import re
 
+def extract_known_and_unknown(responses: List[str]) -> Tuple[List[str], List[str]]:
+    """
+    Extract known and unknown information from text actions.
+
+    Searches for <known>...</known> and <unknown>...</unknown> inside <think>...</think>.
+    Falls back to parsing "Known:" / "Unknown:" headers inside <think> when tags are missing.
+    """
+    known_information: List[str] = []
+    unknown_information: List[str] = []
+
+    def _extract_by_headers(inside: str) -> Tuple[str, str]:
+        # Normalize variants like "Known Information -:" to "Known:"
+        norm = re.sub(r"(?i)\b(known|unknown)\s*(information)?\s*[-–—]?\s*:", r"\1:", inside)
+        flags = re.IGNORECASE | re.DOTALL | re.MULTILINE
+        known_m = re.search(r"^\s*Known\s*:\s*(.*?)(?=^\s*Unknown\s*:|\Z)", norm, flags)
+        unknown_m = re.search(r"^\s*Unknown\s*:\s*(.*?)(?=^\s*[A-Z][^\n]*:|\Z)", norm, flags)
+        known = known_m.group(1).strip() if known_m else ""
+        unknown = unknown_m.group(1).strip() if unknown_m else ""
+        return known, unknown
+
+    for response in responses:
+        # Extract content within <think>...</think>
+        think_match = re.search(r"<think>(.*?)</think>", response, re.DOTALL | re.IGNORECASE)
+        if not think_match:
+            known_information.append("")
+            unknown_information.append("")
+            continue
+        think_content = think_match.group(1)
+
+        # Prefer explicit tags
+        known_match = re.search(r"<known>(.*?)</known>", think_content, re.DOTALL | re.IGNORECASE)
+        unknown_match = re.search(r"<unknown>(.*?)</unknown>", think_content, re.DOTALL | re.IGNORECASE)
+
+        known = known_match.group(1).strip() if known_match else ""
+        unknown = unknown_match.group(1).strip() if unknown_match else ""
+
+        # Fallback to header-style sections inside <think>
+        if not known and not unknown:
+            known, unknown = _extract_by_headers(think_content)
+
+        known_information.append(known)
+        unknown_information.append(unknown)
+
+    return known_information, unknown_information
+
+def select_prompt_variant(config, vanilla_init: str, vanilla_history: str, summary_init: str, summary_history: str) -> Tuple[str, str, bool]:
+    """
+    Return (prompt_init, prompt_history, keep_known_and_unknown) based on config.env.prompt_type.
+    """
+    prompt_type = config.env.get('prompt_type', 'vanilla')
+    if prompt_type == 'summary':
+        return summary_init, summary_history, True
+    if prompt_type == 'vanilla':
+        return vanilla_init, vanilla_history, False
+    raise ValueError(f"Invalid prompt type: {config.env.prompt_type}")
+
 def parse_gamefile(infos):
     gamefile = []
     for info in infos:
@@ -134,17 +190,13 @@ class SearchEnvironmentManager(EnvironmentManagerBase):
 class AlfWorldEnvironmentManager(EnvironmentManagerBase):
     def __init__(self, envs, projection_f, config):
         self.memory = SimpleMemory()
-        prompt_type = config.env.get('prompt_type', 'vanilla')    
-        if prompt_type == 'summary':
-            self.prompt_init = ALFWORLD_TEMPLATE_NO_HIS_SUMMARY
-            self.prompt_history = ALFWORLD_TEMPLATE_SUMMARY
-            self.keep_known_and_unknown = True
-        elif prompt_type == 'vanilla':
-            self.prompt_init = ALFWORLD_TEMPLATE_NO_HIS
-            self.prompt_history = ALFWORLD_TEMPLATE
-            self.keep_known_and_unknown = False
-        else:
-            raise ValueError(f"Invalid prompt type: {config.env.prompt_type}")
+        self.prompt_init, self.prompt_history, self.keep_known_and_unknown = select_prompt_variant(
+            config,
+            ALFWORLD_TEMPLATE_NO_HIS,
+            ALFWORLD_TEMPLATE,
+            ALFWORLD_TEMPLATE_NO_HIS_SUMMARY,
+            ALFWORLD_TEMPLATE_SUMMARY,
+        )
         super().__init__(envs, projection_f, config)
     
     def reset(self, kwargs):
@@ -162,7 +214,7 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
     def step(self, text_actions: List[str]):
         # extract known and unkown here as text_actions will be mutated in place in  self.projection_f
         if self.keep_known_and_unknown:
-            known_information, unknown_information = self.extract_known_and_unknown(text_actions)
+            known_information, unknown_information = extract_known_and_unknown(text_actions)
         actions, valids = self.projection_f(text_actions, self.envs.get_admissible_commands)
         text_obs, image_obs, rewards, dones, infos = self.envs.step(actions)
         self.memory.store({'text_obs': self.pre_text_obs, 'action': actions})
@@ -194,63 +246,6 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
             else:
                 raise ValueError("Task description not found in text observation.")
     
-    def extract_known_and_unknown(self, responses: List[str]) -> Tuple[List[str], List[str]]:
-        """
-        Extract known and unknown information from text actions.
-
-        The function searches for information enclosed within <known>...</known> and <unknown>...</unknown>
-        tags, making sure these are also within <think>...</think> tags, as required by the protocol.
-        Robustly extract known/unknown from model outputs that either:
-        (a) use <known>/<unknown> inside <think>, or
-        (b) use 'Known ...:' / 'Unknown ...:' headers inside <think>.
-
-        Args:
-            responses (List[str]): List of agent responses containing required tags.
-
-        Returns:
-            known_information (List[str]): List of extracted known information strings.
-            unknown_information (List[str]): List of extracted unknown information strings.
-        """
-        known_information: List[str] = []
-        unknown_information: List[str] = []
-
-        def _extract_by_headers(inside: str) -> Tuple[str, str]:
-            # normalize "Known Information:" / "Known -"/"Known —" → "Known:"
-            norm = re.sub(r"(?i)\b(known|unknown)\s*(information)?\s*[-–—]?\s*:", r"\1:", inside)
-
-            flags = re.IGNORECASE | re.DOTALL | re.MULTILINE
-            known_m = re.search(r"^\s*Known\s*:\s*(.*?)(?=^\s*Unknown\s*:|\Z)", norm, flags)
-            unknown_m = re.search(r"^\s*Unknown\s*:\s*(.*?)(?=^\s*[A-Z][^\n]*:|\Z)", norm, flags)
-
-            known = known_m.group(1).strip() if known_m else ""
-            unknown = unknown_m.group(1).strip() if unknown_m else ""
-            return known, unknown
-
-        for response in responses:
-            # Search for content within <think>...</think>
-            think_match = re.search(r"<think>(.*?)</think>", response, re.DOTALL | re.IGNORECASE)
-            if not think_match:
-                known_information.append("")
-                unknown_information.append("")
-                continue
-            think_content = think_match.group(1)
-
-            # Since we assume exactly one <known> and <unknown> per response, use search instead of findall
-            known_match = re.search(r"<known>(.*?)</known>", think_content, re.DOTALL | re.IGNORECASE)
-            unknown_match = re.search(r"<unknown>(.*?)</unknown>", think_content, re.DOTALL | re.IGNORECASE)
-
-            known = known_match.group(1).strip() if known_match else ""
-            unknown = unknown_match.group(1).strip() if unknown_match else ""
-
-            # 2) fallback: header-style "Known:" / "Unknown:" inside <think>
-            if not known and not unknown:
-                known, unknown = _extract_by_headers(think_content)
-
-            known_information.append(known)
-            unknown_information.append(unknown)
-
-        return known_information, unknown_information
-
 
     def build_text_obs(self, text_obs: List[str], admissible_actions: List[List[str]], init: bool = False) -> List[str]:
         """
@@ -493,6 +488,14 @@ class GymCardEnvironmentManager(EnvironmentManagerBase):
 class WebshopEnvironmentManager(EnvironmentManagerBase):
     def __init__(self, envs, projection_f, config):
         self.memory = SimpleMemory()
+        # Support summary/vanilla prompt variants like ALFWorld
+        self.prompt_init, self.prompt_history, self.keep_known_and_unknown = select_prompt_variant(
+            config,
+            WEBSHOP_TEMPLATE_NO_HIS,
+            WEBSHOP_TEMPLATE,
+            WEBSHOP_TEMPLATE_NO_HIS_SUMMARY,
+            WEBSHOP_TEMPLATE_SUMMARY,
+        )
         super().__init__(envs, projection_f, config)
     
     def reset(self, kwargs) -> Dict[str, Any]:
@@ -509,6 +512,9 @@ class WebshopEnvironmentManager(EnvironmentManagerBase):
         return observations, infos
 
     def step(self, text_actions: List[str]):
+        # extract known and unknown before projection if using summary prompts
+        if self.keep_known_and_unknown:
+            known_information, unknown_information = extract_known_and_unknown(text_actions)
         actions, valids = self.projection_f(text_actions)
         next_obs, rewards, dones, infos = self.envs.step(actions)
 
@@ -517,8 +523,15 @@ class WebshopEnvironmentManager(EnvironmentManagerBase):
         self.memory.store({'text_obs': self.pre_text_obs, 'action': actions})
         self.pre_text_obs = next_obs
 
+        if self.keep_known_and_unknown:
+            text_field = self.build_text_obs_with_known_and_unknown(
+                next_obs, infos, known_information, unknown_information
+            )
+        else:
+            text_field = self.build_text_obs(next_obs, infos)
+
         next_observations = {
-            'text': self.build_text_obs(next_obs, infos),
+            'text': text_field,
             'image': None,
             'anchor': next_obs.copy()
         }
@@ -586,13 +599,13 @@ class WebshopEnvironmentManager(EnvironmentManagerBase):
             reformatted_available_actions = "\n".join(f"'{s}'," for s in available_actions)
 
             if init or self.config.env.history_length <= 0:
-                obs = WEBSHOP_TEMPLATE_NO_HIS.format(
+                obs = self.prompt_init.format(
                     task_description=self.tasks[i],
                     current_observation=text_obs[i],
                     available_actions=reformatted_available_actions
                 )
             else:
-                obs = WEBSHOP_TEMPLATE.format(
+                obs = self.prompt_history.format(
                     task_description=self.tasks[i],
                     step_count=len(self.memory[i]),
                     history_length=valid_lens[i],
@@ -603,7 +616,7 @@ class WebshopEnvironmentManager(EnvironmentManagerBase):
                 )
                 if len(obs) > 13000:
                     print(f"Warning len(obs)={len(obs)} is too long")
-                    obs = WEBSHOP_TEMPLATE_NO_HIS.format(
+                    obs = self.prompt_init.format(
                         task_description=self.tasks[i],
                         current_observation=text_obs[i],
                         available_actions=reformatted_available_actions
@@ -611,6 +624,48 @@ class WebshopEnvironmentManager(EnvironmentManagerBase):
 
             postprocess_text_obs.append(obs)
 
+        return postprocess_text_obs
+
+    def build_text_obs_with_known_and_unknown(self, text_obs: List[str], infos: List[List[str]], known_information: List[str], unknown_information: List[str]) -> List[str]:
+        postprocess_text_obs = []
+        if self.config.env.history_length > 0:
+            memory_contexts, valid_lens = self.memory.fetch(
+                    self.config.env.history_length,
+                    obs_key="text_obs",
+                    action_key="action")
+
+        for i in range(len(text_obs)):
+            available_actions = self.format_avail_actions(infos[i]['available_actions'])
+            reformatted_available_actions = "\n".join(f"'{s}'," for s in available_actions)
+
+            if self.config.env.history_length <= 0:
+                obs = self.prompt_init.format(
+                    task_description=self.tasks[i],
+                    current_observation=text_obs[i],
+                    available_actions=reformatted_available_actions
+                )
+            else:
+                obs = self.prompt_history.format(
+                    task_description=self.tasks[i],
+                    step_count=len(self.memory[i]),
+                    history_length=valid_lens[i],
+                    action_history=memory_contexts[i],
+                    known_information=known_information[i],
+                    unknown_information=unknown_information[i],
+                    current_step=len(self.memory[i]) + 1,
+                    current_observation=text_obs[i],
+                    available_actions=reformatted_available_actions
+                )
+
+            if len(obs) > 13000:
+                print(f"Warning len(obs)={len(obs)} is too long")
+                obs = self.prompt_init.format(
+                    task_description=self.tasks[i],
+                    current_observation=text_obs[i],
+                    available_actions=reformatted_available_actions
+                )
+
+            postprocess_text_obs.append(obs)
         return postprocess_text_obs
 
     def _process_batch(self, batch_idx, total_batch_list, total_infos, success):
