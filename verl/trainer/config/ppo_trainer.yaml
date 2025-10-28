@@ -260,9 +260,10 @@ trainer:
   project_name: verl_examples
   experiment_name: gsm8k
   logger: [ 'console', 'wandb' ]
-  log_val_generations: 0
+  log_val_generations: 2
   rollout_data_dir: null # directory for logging the rollout data, no dump if null
   validation_data_dir: null # directory for logging the validation data, no dump if null
+  val_trajectory_dir: ${trainer.default_local_dir}/val_trajectories # where to dump full validation trajectories (JSONL); set to null to disable
   nnodes: 1
   n_gpus_per_node: 8
   save_freq: -1
