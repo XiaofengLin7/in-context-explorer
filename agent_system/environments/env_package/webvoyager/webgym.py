@@ -15,9 +15,9 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.common.action_chains import ActionChains
 
-from webvoyager.prompts import SYSTEM_PROMPT, SYSTEM_PROMPT_TEXT_ONLY
+from .webvoyager.prompts import SYSTEM_PROMPT, SYSTEM_PROMPT_TEXT_ONLY
 from openai import OpenAI
-from webvoyager.utils import get_web_element_rect, encode_image, extract_information, print_message,\
+from .webvoyager.utils import get_web_element_rect, encode_image, extract_information, print_message,\
     get_webarena_accessibility_tree, get_pdf_retrieval_ans_from_assistant, clip_message_and_obs, clip_message_and_obs_text_only
 
 
@@ -27,7 +27,7 @@ class WebVoyagerEnv(gym.Env):
     """
     
     def __init__(self, 
-                 api_key: str,
+                 api_key: str, # only needed for processing pdf files
                  api_model: str = "gpt-4-vision-preview",
                  headless: bool = True,
                  text_only: bool = False,
@@ -64,7 +64,7 @@ class WebVoyagerEnv(gym.Env):
         self.window_width = window_width
         self.window_height = window_height
         self.download_dir = download_dir
-        self.max_attached_imgs = max_attached_imgs
+        #self.max_attached_imgs = max_attached_imgs
         self.fix_box_color = fix_box_color
         self.save_accessibility_tree = save_accessibility_tree
         self.force_device_scale = force_device_scale
@@ -77,20 +77,22 @@ class WebVoyagerEnv(gym.Env):
         
         # Environment state
         self.driver = None
-        self.current_task = None
-        self.current_iteration = 0
-        self.max_iterations = 15
+        self.task = None
+        self.timestep = 0
         self.download_files = []
         self.fail_obs = ""
         self.pdf_obs = ""
         self.warn_obs = ""
-        self.messages = []
-        self.accumulate_prompt_token = 0
-        self.accumulate_completion_token = 0
+        #self.accumulate_prompt_token = 0
+        #self.accumulate_completion_token = 0
 
-        self.img_path = None
-        self.accessibility_tree = None
-        self.web_eles_text = None
+        #self.img_path = None
+        #self.obs_info = None
+        #self.accessibility_tree = None
+        #self.web_eles_text = None
+        #self.web_eles = None
+        self.messages = []
+        #self.init_msg = None
 
         # Ensure download directory exists
         os.makedirs(download_dir, exist_ok=True)
@@ -140,8 +142,8 @@ class WebVoyagerEnv(gym.Env):
         self.driver.set_window_size(self.window_width, self.window_height)
         
         # Store current task
-        self.current_task = task
-        self.current_iteration = 0
+        self.task = task
+        self.timestep = 0
         
         # Clear pdf files in download directory
         for filename in os.listdir(self.download_dir):
@@ -157,7 +159,7 @@ class WebVoyagerEnv(gym.Env):
         self.pdf_obs = ""
         self.warn_obs = ""
         
-        # Initialize messages
+        # Initialize messages, TODO: how to deal with system prompt in verl-agent
         if self.text_only:
             self.messages = [{'role': 'system', 'content': SYSTEM_PROMPT_TEXT_ONLY}]
             obs_prompt = "Observation: please analyze the accessibility tree and give the Thought and Action."
@@ -166,13 +168,13 @@ class WebVoyagerEnv(gym.Env):
             obs_prompt = "Observation: please analyze the attached screenshot and give the Thought and Action. "
         
         # Create initial message with task instructions
-        init_msg = f"""Now given a task: {task['ques']}  Please interact with {task['web']} and get the answer. \n"""
-        init_msg = init_msg + obs_prompt
+        self.init_msg = f"""Now given a task: {task['ques']}  Please interact with {task['web']} and get the answer. \n"""
+        self.init_msg = self.init_msg + obs_prompt
         
         # Add initial message to conversation
         self.messages.append({
             'role': 'user',
-            'content': init_msg
+            'content': self.init_msg
         })
         
         # Navigate to the task URL
@@ -186,6 +188,31 @@ class WebVoyagerEnv(gym.Env):
         # Prevent space key from scrolling
         self.driver.execute_script("""window.onkeydown = function(e) {if(e.keyCode == 32 && e.target.type != 'text' && e.target.type != 'textarea') {e.preventDefault();}};""")
         time.sleep(5)
+
+        # get env info
+        try:
+            if not self.text_only:
+                rects, self.web_eles, self.web_eles_text = get_web_element_rect(self.driver, fix_color=self.fix_box_color)
+            else:
+                accessibility_tree_path = os.path.join(self.task_dir, 'accessibility_tree{}'.format(self.timestep))
+                self.accessibility_tree, self.obs_info = get_webarena_accessibility_tree(self.driver, accessibility_tree_path)
+
+        except Exception as e:
+            if not self.text_only:
+                logging.error('Driver error when adding set-of-mark.')
+                self.fail_obs = "Driver error when adding set-of-mark."
+            else:
+                logging.error('Driver error when obtaining accessibility tree.')
+                self.fail_obs = "Driver error when obtaining accessibility tree."
+            logging.error(e)
+            
+        self.img_path = os.path.join(self.task_dir, 'screenshot{}.png'.format(self.timestep))
+        self.driver.save_screenshot(self.img_path)
+
+        # accessibility tree
+        if (not self.text_only) and self.save_accessibility_tree:
+            accessibility_tree_path = os.path.join(self.task_dir, 'accessibility_tree{}'.format(self.timestep))
+            self.accessibility_tree, self.obs_info = get_webarena_accessibility_tree(self.driver, accessibility_tree_path)
         
         # Get initial observation
         observation = self.get_observation()
@@ -193,7 +220,7 @@ class WebVoyagerEnv(gym.Env):
             'task_id': task['id'],
             'task_question': task['ques'],
             'task_url': task['web'],
-            'iteration': self.current_iteration
+            'iteration': self.timestep
         }
         
         return observation, info
@@ -205,10 +232,9 @@ class WebVoyagerEnv(gym.Env):
         Args:
             action: Dictionary containing action information:
                 - 'action_key': str - one of 'click', 'type', 'scroll', 'wait', 'goback', 'google', 'answer'
-                - 'element':
-                - 'content':
-                - 'direction':
-                - 'answer_content': 
+                - 'element': int
+                - 'content': str
+                - 'answer_content': str 
             
         Returns:
             observation: New observation after action
@@ -216,7 +242,7 @@ class WebVoyagerEnv(gym.Env):
             done: Whether the episode is done (terminated or truncated)
             info: Additional information
         """
-        self.current_iteration += 1
+        self.timestep += 1
         
         # get action info, may have a different structure
         action_key = action["action_key"]
@@ -229,35 +255,8 @@ class WebVoyagerEnv(gym.Env):
         self.pdf_obs = ""
         self.warn_obs = ""
         
-        # get env info
-        try:
-            if not self.text_only:
-                rects, web_eles, self.web_eles_text = get_web_element_rect(self.driver, fix_color=self.fix_box_color)
-            else:
-                accessibility_tree_path = os.path.join(self.task_dir, 'accessibility_tree{}'.format(self.current_iteration))
-                self.accessibility_tree, obs_info = get_webarena_accessibility_tree(self.driver, accessibility_tree_path)
-
-        except Exception as e:
-            if not self.text_only:
-                logging.error('Driver error when adding set-of-mark.')
-                self.fail_obs = "Driver error when adding set-of-mark."
-            else:
-                logging.error('Driver error when obtaining accessibility tree.')
-                self.fail_obs = "Driver error when obtaining accessibility tree."
-            logging.error(e)
-            
-        self.img_path = os.path.join(self.task_dir, 'screenshot{}.png'.format(self.current_iteration))
-        self.driver.save_screenshot(self.img_path)
-
-        # accessibility tree
-        if (not self.text_only) and self.save_accessibility_tree:
-            accessibility_tree_path = os.path.join(self.task_dir, 'accessibility_tree{}'.format(self.current_iteration))
-            self.accessibility_tree, obs_info = get_webarena_accessibility_tree(self.driver, accessibility_tree_path)
-
-        # encode image
+        # encode image (verl-agent just need image path, no encoding)
         #b64_img = encode_image(self.img_path)
-
-        # TODO: deal with message
 
         # execute action
         try:
@@ -268,14 +267,14 @@ class WebVoyagerEnv(gym.Env):
                 try:
                     if not self.text_only:
                         click_ele_number = action['element']
-                        if click_ele_number >= len(web_eles):
-                            raise IndexError(f"Element index {click_ele_number} out of range. Available elements: {len(web_eles)}")
-                        web_ele = web_eles[click_ele_number]
+                        if click_ele_number >= len(self.web_eles):
+                            raise IndexError(f"Element index {click_ele_number} out of range. Available elements: {len(self.web_eles)}")
+                        web_ele = self.web_eles[click_ele_number]
                     else:
                         click_ele_number = action['element']
-                        if click_ele_number >= len(obs_info):
-                            raise IndexError(f"Element index {click_ele_number} out of range. Available elements: {len(obs_info)}")
-                        element_box = obs_info[click_ele_number]['union_bound']
+                        if click_ele_number >= len(self.obs_info):
+                            raise IndexError(f"Element index {click_ele_number} out of range. Available elements: {len(self.obs_info)}")
+                        element_box = self.obs_info[click_ele_number]['union_bound']
                         element_box_center = (element_box[0] + element_box[2] // 2,
                                                 element_box[1] + element_box[3] // 2)
                         web_ele = self.driver.execute_script("return document.elementFromPoint(arguments[0], arguments[1]);", element_box_center[0], element_box_center[1])
@@ -291,7 +290,6 @@ class WebVoyagerEnv(gym.Env):
                         time.sleep(10)
                 except Exception as e:
                     self.fail_obs = f"Click action failed: {str(e)}"
-                    reward = -0.1
 
             elif action_key == 'wait':
                 time.sleep(10)
@@ -300,36 +298,33 @@ class WebVoyagerEnv(gym.Env):
                 try:
                     if not self.text_only:
                         type_ele_number = action['element']
-                        if type_ele_number >= len(web_eles):
-                            raise IndexError(f"Element index {type_ele_number} out of range. Available elements: {len(web_eles)}")
-                        web_ele = web_eles[type_ele_number]
+                        if type_ele_number >= len(self.web_eles):
+                            raise IndexError(f"Element index {type_ele_number} out of range. Available elements: {len(self.web_eles)}")
+                        web_ele = self.web_eles[type_ele_number]
                     else:
                         type_ele_number = action['element']
-                        print(f"len obs info: {len(obs_info)}")
-                        if type_ele_number >= len(obs_info):
-                            raise IndexError(f"Element index {type_ele_number} out of range. Available elements: {len(obs_info)}")
-                        element_box = obs_info[type_ele_number]['union_bound']
+                        if type_ele_number >= len(self.obs_info):
+                            raise IndexError(f"Element index {type_ele_number} out of range. Available elements: {len(self.obs_info)}")
+                        element_box = self.obs_info[type_ele_number]['union_bound']
                         print(f"element box: {element_box}")
                         element_box_center = (element_box[0] + element_box[2] // 2,
                                                 element_box[1] + element_box[3] // 2)
                         web_ele = self.driver.execute_script("return document.elementFromPoint(arguments[0], arguments[1]);", element_box_center[0], element_box_center[1])
 
                     self.warn_obs = self._exec_action_type(action, web_ele)
-                    if 'wolfram' in self.current_task['web']:
+                    if 'wolfram' in self.task['web']:
                         time.sleep(5)
                 except Exception as e:
                     self.fail_obs = f"Type action failed: {str(e)}"
-                    reward = -0.1
 
             elif action_key == 'scroll':
                 try:
                     if not self.text_only:
-                        self._exec_action_scroll(action, web_eles, None)
+                        self._exec_action_scroll(action)
                     else:
-                        self._exec_action_scroll(action, None, obs_info)
+                        self._exec_action_scroll(action)
                 except Exception as e:
                     self.fail_obs = f"Scroll action failed: {str(e)}"
-                    reward = -0.1
 
             elif action_key == 'goback':
                 self.driver.back()
@@ -342,7 +337,7 @@ class WebVoyagerEnv(gym.Env):
             elif action_key == 'answer':
                 logging.info(action['answer_content'])
                 logging.info('finish!!')
-
+                done = True
             else:
                 raise NotImplementedError
 
@@ -357,18 +352,39 @@ class WebVoyagerEnv(gym.Env):
                 self.fail_obs = ""
             time.sleep(2)
         
-        # Check if max iterations reached
-        if self.current_iteration >= self.max_iterations:
-            done = True
+        # in the multi-turn loop in verl-agent, check if max iterations reached
         
         if self.fail_obs:
             done = True
+        
+        # get env info
+        try:
+            if not self.text_only:
+                rects, self.web_eles, self.web_eles_text = get_web_element_rect(self.driver, fix_color=self.fix_box_color)
+            else:
+                accessibility_tree_path = os.path.join(self.task_dir, 'accessibility_tree{}'.format(self.timestep))
+                self.accessibility_tree, self.obs_info = get_webarena_accessibility_tree(self.driver, accessibility_tree_path)
+
+        except Exception as e:
+            if not self.text_only:
+                logging.error('Driver error when adding set-of-mark.')
+            else:
+                logging.error('Driver error when obtaining accessibility tree.')
+            logging.error(e)
+            
+        self.img_path = os.path.join(self.task_dir, 'screenshot{}.png'.format(self.timestep))
+        self.driver.save_screenshot(self.img_path)
+
+        # accessibility tree
+        if (not self.text_only) and self.save_accessibility_tree:
+            accessibility_tree_path = os.path.join(self.task_dir, 'accessibility_tree{}'.format(self.timestep))
+            self.accessibility_tree, self.obs_info = get_webarena_accessibility_tree(self.driver, accessibility_tree_path)
         
         # Get new observation
         observation = self.get_observation()
         
         info = {
-            'iteration': self.current_iteration,
+            'iteration': self.timestep,
             'action_key': action_key,
             'reward': reward,
             'done': done
@@ -380,15 +396,16 @@ class WebVoyagerEnv(gym.Env):
         """Get current observation from the environment."""
         # we can append those we need
         observation = {
-            'screenshot': self.img_path,
-            'web_elements_text': self.web_eles_text,
-            'accessibility_tree': self.accessibility_tree,
-            'pdf_obs': self.pdf_obs,
-            'warn_obs': self.warn_obs,
-            'fail_obs': self.fail_obs,
-            'iteration': np.array(self.current_iteration, dtype=np.int32),
-            'task_question': self.current_task['ques'] if self.current_task else "",
-            'task_url': self.current_task['web'] if self.current_task else ""
+                'image': self.img_path,
+                'ac_tree': self.accessibility_tree,
+                'pdf_obs': self.pdf_obs,
+                'warn_obs': self.warn_obs,
+                'fail_obs': self.fail_obs,
+                'task_ques': self.task['ques'] if self.task else "",
+                'url': self.driver.current_url,
+                'web_name': self.task['web_name'],
+                'task_dir': self.task_dir,
+                'starting_url': self.task['web'] if self.task else ""
         }
         return observation
     
@@ -397,6 +414,7 @@ class WebVoyagerEnv(gym.Env):
         web_ele.click()
         time.sleep(3)
 
+    # TODO: sometimes cannot clear correctly and collapse
     def _exec_action_type(self, action, web_ele):
         self.warn_obs = ""
         type_content = action['content']
@@ -438,7 +456,7 @@ class WebVoyagerEnv(gym.Env):
         time.sleep(10)
         return self.warn_obs
 
-    def _exec_action_scroll(self, action, web_eles, obs_info):
+    def _exec_action_scroll(self, action):
         scroll_ele_number = action['element']
         scroll_content = action['content']
         if scroll_ele_number == -1:
@@ -449,13 +467,13 @@ class WebVoyagerEnv(gym.Env):
         else:
             if not self.text_only:
                 scroll_ele_number = int(scroll_ele_number)
-                if scroll_ele_number >= len(web_eles):
-                    raise IndexError(f"Element index {scroll_ele_number} out of range. Available elements: {len(web_eles)}")
-                web_ele = web_eles[scroll_ele_number]
+                if scroll_ele_number >= len(self.web_eles):
+                    raise IndexError(f"Element index {scroll_ele_number} out of range. Available elements: {len(self.web_eles)}")
+                web_ele = self.web_eles[scroll_ele_number]
             else:
-                if scroll_ele_number >= len(obs_info):
-                    raise IndexError(f"Element index {scroll_ele_number} out of range. Available elements: {len(obs_info)}")
-                element_box = obs_info[scroll_ele_number]['union_bound']
+                if scroll_ele_number >= len(self.obs_info):
+                    raise IndexError(f"Element index {scroll_ele_number} out of range. Available elements: {len(self.obs_info)}")
+                element_box = self.obs_info[scroll_ele_number]['union_bound']
                 element_box_center = (element_box[0] + element_box[2] // 2, element_box[1] + element_box[3] // 2)
                 web_ele = self.driver.execute_script("return document.elementFromPoint(arguments[0], arguments[1]);", element_box_center[0], element_box_center[1])
             actions = ActionChains(self.driver)
@@ -487,41 +505,3 @@ class WebVoyagerEnv(gym.Env):
     def __del__(self):
         """Destructor to ensure cleanup."""
         self.close()
-
-
-# Example usage
-if __name__ == "__main__":
-    # Example of how to use the environment
-    env = WebVoyagerEnv(
-        api_key="your-api-key-here",
-        headless=True,
-        text_only=True,
-    )
-    
-    # Example task
-    task = {"web_name": "Cambridge Dictionary", "id": "Cambridge Dictionary--29", "ques": "Go to the Plus section of Cambridge Dictionary, find Image quizzes and do an easy quiz about Animals and tell me your final score.", "web": "https://dictionary.cambridge.org/"}
-    
-    # Reset environment
-    obs, info = env.reset(task)
-    print(f"Environment reset. Task: {info['task_question']}")
-    
-    # Example actions
-    actions = [
-        {'action_key': 'scroll', 'element': -1, 'content': 'down'},
-        {'action_key': 'type', 'element': 1, 'content': 'test'},
-        {'action_key': 'click', 'element': 0},
-        {'action_key': 'wait'},
-        {'action_key': 'answer', 'answer_content': 'Finish the task'}
-        
-    ]
-    
-    # Execute actions
-    for i, action in enumerate(actions):
-        obs, reward, done, info = env.step(action)
-        print(f"Step {i+1}: Action {action['action_key']}, Reward {reward}, Done {done}")
-        
-        if done:
-            break
-    
-    # Close environment
-    env.close()
