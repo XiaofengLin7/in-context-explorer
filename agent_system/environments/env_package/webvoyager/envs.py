@@ -14,7 +14,7 @@ def load_config_file(path):
 
 class WebVoyagerWorker:
     def __init__(self, seed, data_file, env_kwargs):
-        from webgym import WebVoyagerEnv
+        from .webgym import WebVoyagerEnv
         self.env = WebVoyagerEnv(
                     api_key="your-api-key-here",
                     headless=True,
@@ -112,7 +112,7 @@ class WebVoyagerMultiProcessEnv(gym.Env):
         self.task_idxs = range(data_size)
 
         # -------------------------- Ray actors setup --------------------------
-        env_worker = ray.remote(**resources_per_worker)(WebvoyagerWorker)
+        env_worker = ray.remote(**resources_per_worker)(WebVoyagerWorker)
         self._workers = []
         for i in range(self.num_processes):
             worker = env_worker.remote(seed + (i // self.group_n), self.data_file, self._env_kwargs)
@@ -232,37 +232,3 @@ def build_webvoyager_envs(
         config_path=config_path,
         env_kwargs=env_kwargs,
     )
-
-
-if __name__ == "__main__":
-    # Simple smoke test for the reset() function
-    # It will launch headless Chrome instances; ensure chromedriver is installed.
-    try:
-        # Point WEBVOYAGER_DATA to the bundled data directory for convenience
-        base_dir = os.path.dirname(__file__)
-        os.environ['WEBVOYAGER_DATA'] = '/usr3/graduate/xfl/lab/verl-agent/agent_system/environments/env_package/webvoyager/webvoyager/data'
-
-        env = WebVoyagerMultiProcessEnv(
-            seed=0,
-            env_num=1,
-            group_n=1,
-            resources_per_worker={"num_cpus": 1},
-            is_train=False,  # use the smaller test split from configs
-            config_path=os.path.join(base_dir, 'configs', 'configs.yaml'),
-            env_kwargs={
-                "headless": True,
-                "text_only": True,
-            },
-        )
-
-        obs_list, info_list = env.reset()
-        pprint(obs_list)
-        print("reset ok", len(obs_list))
-        if info_list:
-            print("info keys:", list(info_list[0].keys()))
-
-    finally:
-        try:
-            env.close()
-        except Exception:
-            pass
