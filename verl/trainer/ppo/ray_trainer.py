@@ -738,12 +738,37 @@ class RayPPOTrainer:
         for traj in trajs.values():
             traj["steps"].sort(key=lambda x: x["step"])  # type: ignore[index]
 
-        # Append to a single JSONL per validation step
+        # Limit the number of trajectories stored per file
+        max_traj_per_file = 10
+        selected_trajs = list(trajs.values())
+        if max_traj_per_file > 0 and len(selected_trajs) > max_traj_per_file:
+            try:
+                # Deterministic selection: sort by traj_uid when present
+                selected_trajs.sort(key=lambda t: t.get("traj_uid", ""))
+            except Exception:
+                pass
+            selected_trajs = selected_trajs[:max_traj_per_file]
+
+        # Append up to N trajectories per validation step
         with open(filename, "a", encoding="utf-8") as f:
-            for traj in trajs.values():
+            for traj in selected_trajs:
                 f.write(json.dumps(traj, ensure_ascii=False) + "\n")
 
         print(f"Dumped validation trajectories to {filename}")
+
+        # Upload to tracking backends if configured
+        try:
+            if hasattr(self, "tracking") and self.tracking is not None:
+                self.tracking.log_artifact(
+                    file_path=filename,
+                    artifact_path="val_trajectories",
+                    artifact_name=f"val_trajs_step_{self.global_steps}",
+                    artifact_type="dataset",
+                )
+        except Exception as e:
+            print(f"WARNING: failed to upload validation trajectories: {e}")
+
+        # Note: per-file trajectory count is limited; we no longer prune files here.
 
     def _maybe_log_val_generations(self, inputs, outputs, scores):
         """Log a table of validation samples to the configured logger (wandb or swanlab)"""
@@ -1127,6 +1152,9 @@ class RayPPOTrainer:
             default_backend=self.config.trainer.logger,
             config=OmegaConf.to_container(self.config, resolve=True),
         )
+
+        # Expose tracking logger to other methods for artifact uploads
+        self.tracking = logger
 
         self.global_steps = 0
 
