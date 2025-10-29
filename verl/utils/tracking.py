@@ -129,6 +129,58 @@ class Tracking:
             if backend is None or default_backend in backend:
                 logger_instance.log(data=data, step=step)
 
+    def log_artifact(self, file_path: str, artifact_path: str | None = None, artifact_name: str | None = None, artifact_type: str = "dataset") -> None:
+        """Upload a local file as an artifact to configured tracking backends.
+
+        Args:
+            file_path: Absolute or relative path to the file to upload.
+            artifact_path: Remote subdirectory/group name (e.g., "val_trajectories") for backends that support it.
+            artifact_name: Name to use for the artifact (used by wandb-like backends). Defaults to basename.
+            artifact_type: Artifact type string for wandb-compatible backends.
+        """
+        import os
+
+        try:
+            if not os.path.isabs(file_path):
+                file_path = os.path.abspath(file_path)
+            if not os.path.isfile(file_path):
+                print(f"WARNING: log_artifact skipped, file not found: {file_path}")
+                return
+
+            backends: list[str] = list(self.logger.keys())
+
+            if "mlflow" in backends:
+                try:
+                    import mlflow  # type: ignore
+
+                    mlflow.log_artifact(file_path, artifact_path=artifact_path)
+                except Exception as e:
+                    print(f"WARNING: mlflow artifact upload failed: {e}")
+
+            if "wandb" in backends:
+                try:
+                    import wandb  # type: ignore
+
+                    name = artifact_name or os.path.basename(file_path)
+                    artifact = wandb.Artifact(name=name, type=artifact_type)
+                    artifact.add_file(file_path)
+                    wandb.log_artifact(artifact)
+                except Exception as e:
+                    print(f"WARNING: wandb artifact upload failed: {e}")
+
+            if "vemlp_wandb" in backends:
+                try:
+                    from volcengine_ml_platform import wandb as vemlp_wandb  # type: ignore
+
+                    name = artifact_name or os.path.basename(file_path)
+                    artifact = vemlp_wandb.Artifact(name=name, type=artifact_type)
+                    artifact.add_file(file_path)
+                    vemlp_wandb.log_artifact(artifact)
+                except Exception as e:
+                    print(f"WARNING: vemlp_wandb artifact upload failed: {e}")
+        except Exception as e:
+            print(f"WARNING: artifact upload failed: {e}")
+
     def __del__(self):
         if "wandb" in self.logger:
             self.logger["wandb"].finish(exit_code=0)

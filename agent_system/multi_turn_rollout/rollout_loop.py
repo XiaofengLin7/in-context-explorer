@@ -377,6 +377,8 @@ class TrajectoryCollector:
             assert len(rewards) == batch_size, f"env should return rewards for all environments, got {len(rewards)} rewards for {batch_size} environments"
             batch.non_tensor_batch['rewards'] = torch_to_numpy(rewards, is_object=True)
             batch.non_tensor_batch['active_masks'] = torch_to_numpy(active_masks, is_object=True)
+            # Record the per-timestep index for ordering within each trajectory during later aggregation/logging
+            batch.non_tensor_batch['step_idx'] = np.array([_step for _ in range(batch_size)], dtype=np.int32)
             
             # Update episode lengths for active environments
             batch_list: list[dict] = to_list_of_dict(batch)
