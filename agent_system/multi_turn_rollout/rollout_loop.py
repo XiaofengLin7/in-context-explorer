@@ -415,7 +415,7 @@ class TrajectoryCollector:
                     # ensure numpy arrays
                     success_indicator = np.array(success_rate, dtype=np.float32)
                     T = np.array(episode_lengths, dtype=np.float32)
-                    episode_rewards = -T + success_coef * success_indicator
+                    episode_rewards = (-T + success_coef) * success_indicator
 
 
         return total_batch_list, episode_rewards, episode_lengths, success, traj_uid, tool_callings

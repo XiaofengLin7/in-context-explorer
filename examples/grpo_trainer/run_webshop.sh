@@ -24,7 +24,7 @@ python3 -m verl.trainer.main_ppo \
     data.val_files=$HOME/data/verl-agent/text/test.parquet \
     data.train_batch_size=$train_data_size \
     data.val_batch_size=$val_data_size \
-    data.max_prompt_length=6000 \
+    data.max_prompt_length=7500 \
     data.max_response_length=512 \
     data.filter_overlong_prompts=True \
     data.truncation='error' \
