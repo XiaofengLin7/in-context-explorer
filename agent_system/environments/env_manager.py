@@ -676,7 +676,7 @@ class WebshopEnvironmentManager(EnvironmentManagerBase):
                 won_value = float(info['won'])
                 score_value = float(info['task_score'])
                 success['success_rate'].append(won_value)
-                success['webshop_task_score (not success_rate)'].append(score_value)
+                success['webshop_task_score_not_success_rate'].append(score_value)
                 return
 
 class AppWorldEnvironmentManager(EnvironmentManagerBase):
