@@ -1,4 +1,12 @@
 dataset:
   train_data_path: "$WEBVOYAGER_DATA/TTI_WebVoyager_train_data.jsonl"
   test_data_path: "$WEBVOYAGER_DATA/WebVoyager_data.jsonl"
+webarena: True
+common_webarena_host: "ec2-3-136-229-169.us-east-2.compute.amazonaws.com"
+webarena_host:
+      reddit: ${common_webarena_host} 
+      shopping_admin: ${common_webarena_host}
+      gitlab: ${common_webarena_host}
+      map: ${common_webarena_host}
+      shopping: ${common_webarena_host}
 
