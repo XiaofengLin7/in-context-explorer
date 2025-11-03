@@ -19,16 +19,18 @@ from .webvoyager.prompts import SYSTEM_PROMPT, SYSTEM_PROMPT_TEXT_ONLY
 from openai import OpenAI
 from .webvoyager.utils import get_web_element_rect, encode_image, extract_information, print_message,\
     get_webarena_accessibility_tree, get_pdf_retrieval_ans_from_assistant, clip_message_and_obs, clip_message_and_obs_text_only
+from .webvoyager.utils_webarena import webarena_login, WEBARENA_DOMAINS
 
 
 class WebVoyagerEnv(gym.Env):
     """
-    Gym wrapper for WebVoyager Environment
+    Gym wrapper for WebVoyager/WebArena Environment
     """
     
-    def __init__(self, 
+    def __init__(self,
                  api_key: str, # only needed for processing pdf files
                  api_model: str = "gpt-4-vision-preview",
+                 env_config = None,
                  headless: bool = True,
                  text_only: bool = False,
                  window_width: int = 1024,
@@ -36,8 +38,10 @@ class WebVoyagerEnv(gym.Env):
                  download_dir: str = "downloads",
                  max_attached_imgs: int = 1,
                  fix_box_color: bool = True,
-                 save_accessibility_tree: bool = False,
-                 force_device_scale: bool = False):
+                 save_accessibility_tree: bool = True,
+                 force_device_scale: bool = False,
+                 batch_id: int = 0,
+                 num_containers_per_machine: int = 1):
         """
         Initialize the WebVoyager environment.
         
@@ -53,12 +57,21 @@ class WebVoyagerEnv(gym.Env):
             fix_box_color: Whether to fix box colors
             save_accessibility_tree: Whether to save accessibility tree
             force_device_scale: Whether to force device scale
+            batch_id: Batch ID for multi-container setups
+            num_containers_per_machine: Number of containers per machine
         """
         super().__init__()
         
         # Store configuration
         self.api_key = api_key
         self.api_model = api_model # to process pdf files
+        
+        self.env_config = env_config
+        if self.env_config.webarena:
+            self.webarena_host = env_config.webarena_host
+        else:
+            self.webarena_host = None
+        
         self.headless = headless
         self.text_only = text_only
         self.window_width = window_width
@@ -68,6 +81,9 @@ class WebVoyagerEnv(gym.Env):
         self.fix_box_color = fix_box_color
         self.save_accessibility_tree = save_accessibility_tree
         self.force_device_scale = force_device_scale
+        self.batch_id = batch_id
+        self.num_containers_per_machine = num_containers_per_machine
+        self.url_mapping = []
         
         # Initialize OpenAI client
         self.client = OpenAI(api_key=api_key)
@@ -86,9 +102,9 @@ class WebVoyagerEnv(gym.Env):
         #self.accumulate_prompt_token = 0
         #self.accumulate_completion_token = 0
 
-        #self.img_path = None
+        self.img_path = None
         #self.obs_info = None
-        #self.accessibility_tree = None
+        self.accessibility_tree = None
         #self.web_eles_text = None
         #self.web_eles = None
         self.messages = []
@@ -151,7 +167,7 @@ class WebVoyagerEnv(gym.Env):
             if os.path.isfile(file_path):
                 os.remove(file_path)
         
-        self.task_dir = os.path.join(self.download_dir, 'task{}'.format(task["id"]))
+        self.task_dir = os.path.join(self.download_dir, 'task{}'.format(task["id"]), 'batch_id{}'.format(self.batch_id))
         os.makedirs(self.task_dir, exist_ok=True)
 
         self.download_files = []
@@ -159,26 +175,43 @@ class WebVoyagerEnv(gym.Env):
         self.pdf_obs = ""
         self.warn_obs = ""
         
-        # Initialize messages, TODO: how to deal with system prompt in verl-agent
-        if self.text_only:
-            self.messages = [{'role': 'system', 'content': SYSTEM_PROMPT_TEXT_ONLY}]
-            obs_prompt = "Observation: please analyze the accessibility tree and give the Thought and Action."
-        else:
-            self.messages = [{'role': 'system', 'content': SYSTEM_PROMPT}]
-            obs_prompt = "Observation: please analyze the attached screenshot and give the Thought and Action. "
+        # Initialize URL mapping
+        self.url_mapping = [(task['web'], task['web'])]
+        url = task['web']
+        # Handle WebArena login if needed (do this before creating messages)
+        if self.webarena_host and task.get('web_name') and task['web_name'] in WEBARENA_DOMAINS:
+            url = url.replace("ec2-98-81-119-107.compute-1.amazonaws.com", self.env_config.common_webarena_host) # replace the starting url with host server
+            # Replace reddit references in task question (similar to webgym implementation)
+            if task['web_name'] == 'reddit':
+                task['ques'] = task['ques'].replace("subreddit", "subforum").replace("sub-reddit", "subforum").replace("reddit", "postmill").replace("Reddit", "Postmill")
+            
+            success, url_mapping, url = webarena_login(
+                task['web_name'], 
+                url, 
+                self.driver, 
+                self.webarena_host, 
+                batch_id=self.batch_id, 
+                num_containers_per_machine=self.num_containers_per_machine
+            )
+
+            if not success:
+                logging.error(f"[ERROR] WEBARENA LOGIN FAIL for {task['web_name']}")
+                self.fail_obs = f"WebArena login failed for {task['web_name']}"
+                observation = self.get_observation()
+                info = {
+                    'task_id': task['id'],
+                    'task_question': task['ques'],
+                    'task_url': task['web'],
+                    'iteration': self.timestep
+                }
+                return observation, info
+            self.url_mapping = url_mapping
         
-        # Create initial message with task instructions
-        self.init_msg = f"""Now given a task: {task['ques']}  Please interact with {task['web']} and get the answer. \n"""
-        self.init_msg = self.init_msg + obs_prompt
-        
-        # Add initial message to conversation
-        self.messages.append({
-            'role': 'user',
-            'content': self.init_msg
-        })
+        self.starting_url = url
+        print(f"url returned from login: {url}")
         
         # Navigate to the task URL
-        self.driver.get(task['web'])
+        self.driver.get(url)
         try:
             self.driver.find_element(By.TAG_NAME, 'body').click()
         except Exception as e:
@@ -247,7 +280,6 @@ class WebVoyagerEnv(gym.Env):
         # get action info, may have a different structure
         action_key = action["action_key"]
 
-        # Execute the action
         reward = 0.0
         done = False
         
@@ -255,9 +287,6 @@ class WebVoyagerEnv(gym.Env):
         self.pdf_obs = ""
         self.warn_obs = ""
         
-        # encode image (verl-agent just need image path, no encoding)
-        #b64_img = encode_image(self.img_path)
-
         # execute action
         try:
             window_handle_task = self.driver.current_window_handle
@@ -284,7 +313,27 @@ class WebVoyagerEnv(gym.Env):
 
                     self._exec_action_click(action, web_ele)
 
-                    # deal with PDF file (TODO)
+                    # deal with PDF file
+                    current_files = sorted(os.listdir(self.download_dir))
+                    if current_files != self.download_files:
+                        # wait for download finish
+                        time.sleep(10)
+                        current_files = sorted(os.listdir(self.download_dir))
+
+                        current_download_file = [pdf_file for pdf_file in current_files if pdf_file not in self.download_files and pdf_file.endswith('.pdf')]
+                        if current_download_file:
+                            print('start to solve pdf')
+                            pdf_file = current_download_file[0]
+                            pdf_file_path = os.path.join(self.download_dir, pdf_file)
+                            try:
+                                pdf_obs = get_pdf_retrieval_ans_from_claude(pdf_file_path, self.task['ques'], region_name=self.region, aws_key_id=self.aws_key_id, aws_secret_key=self.aws_secret_key)
+                            except:
+                                pdf_obs = ""
+                            shutil.copy(pdf_file_path, self.task_dir)
+                            self.pdf_obs = "You downloaded a PDF file, I ask the Assistant API to answer the task based on the PDF file and get the following response: " + pdf_obs
+                            print("pdf solved", pdf_obs)
+
+                        self.download_files = current_files
 
                     if ele_tag_name == 'button' and ele_type == 'submit':
                         time.sleep(10)
@@ -394,6 +443,16 @@ class WebVoyagerEnv(gym.Env):
     
     def get_observation(self) -> Dict[str, Any]:
         """Get current observation from the environment."""
+        # Apply URL mapping if webarena is used
+        url = self.driver.current_url
+        if self.url_mapping:
+            for map_pattern in self.url_mapping:
+                url = url.replace(map_pattern[0], map_pattern[1]) if map_pattern[0] in url else url
+        
+        if self.url_mapping:
+            for map_pattern in self.url_mapping:
+                self.starting_url = self.starting_url.replace(map_pattern[0], map_pattern[1]) if map_pattern[0] in self.starting_url else self.starting_url
+        
         # we can append those we need
         observation = {
                 'image': self.img_path,
@@ -402,10 +461,10 @@ class WebVoyagerEnv(gym.Env):
                 'warn_obs': self.warn_obs,
                 'fail_obs': self.fail_obs,
                 'task_ques': self.task['ques'] if self.task else "",
-                'url': self.driver.current_url,
-                'web_name': self.task['web_name'],
+                'url': url,
+                'web_name': self.task['web_name'] if self.task else "",
                 'task_dir': self.task_dir,
-                'starting_url': self.task['web'] if self.task else ""
+                'starting_url': self.starting_url
         }
         return observation
     
