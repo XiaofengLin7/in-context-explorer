@@ -1,4 +1,17 @@
 ## Installation
+For alfworld installation, please refer to README-verl-agent.md.
+### Webvoyager
+```
+git submodule update --init --recursive
+conda activate verl-agent # activate your previous installed conda env following README-verl-agent.md
+pip install -r agent_system/environments/env_package/webvoyager/webvoyager/requirements.txt
+```
+Test your webvoyager
+```
+cd agent_system/environments/env_package/webvoyager/webvoyager
+bash run.sh
+```
+check your /results/your_exp_time/agent.log under current webvoyager directory, if makes sense, then configuration is finished.
 Please refer to README-verl-agent.md
 ### Appworld
 ```

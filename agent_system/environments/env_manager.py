@@ -21,7 +21,7 @@ from functools import partial
 import os
 from agent_system.environments.prompts import *
 from agent_system.environments.base import EnvironmentManagerBase, to_numpy
-from agent_system.memory import SimpleMemory, SearchMemory
+from agent_system.memory import SimpleMemory, SearchMemory, WebVoyagerMemory
 from omegaconf import OmegaConf
 import re
 
@@ -97,6 +97,8 @@ def set_gamefile(infos, gamefile):
         else:
             infos[i]['extra.gamefile'] = None
     return infos
+
+
 
 
 class SearchEnvironmentManager(EnvironmentManagerBase):
@@ -762,6 +764,151 @@ class AppWorldEnvironmentManager(EnvironmentManagerBase):
                 postprocess_text_obs.append(obs)
         return postprocess_text_obs
 
+class WebVoyagerEnvironmentManager(EnvironmentManagerBase):
+    def __init__(self, envs, projection_f, config):
+        self.memory = WebVoyagerMemory()
+        super().__init__(envs, projection_f, config)
+    
+    def reset(self, kwargs):
+        obs_list, infos = self.envs.reset()
+
+        # Initialize memory buffer
+        batch_size = len(obs_list)
+        self.memory.reset(batch_size=batch_size)
+
+        # Build initial user messages and store
+        initial_user_texts: List[str] = []
+        images_batch: List[Any] = []
+        image_paths: List[Any] = []
+        urls: List[Any] = []
+        trees: List[Any] = []
+        warns: List[Any] = []
+        pdfs: List[Any] = []
+        fails: List[Any] = []
+        
+        for obs in obs_list:
+            task_goal = obs.get('task_ques', '')
+            url = obs.get('starting_url', '')
+            tree = obs.get('ac_tree', '')
+            img_path = obs.get('image')
+
+            init_text = WEBVOYAGER_PROMPT_TEMPLATE["initial"].format(
+                task_goal=task_goal,
+                url=url,
+                accessibility_tree=tree or ""
+            )
+            # # Append a single image placeholder if we have a screenshot
+            # if img_path:
+            #     init_text = init_text + "\n\n<image>"
+
+            initial_user_texts.append(init_text)
+            images_batch.append([img_path] if img_path else None)
+            image_paths.append(img_path)
+            urls.append(url)
+            trees.append(tree)
+            warns.append(obs.get('warn_obs', ''))
+            pdfs.append(obs.get('pdf_obs', ''))
+            fails.append(obs.get('fail_obs', ''))
+
+        self.memory.store({
+            "user_text": initial_user_texts,
+            "assistant_text": [None] * batch_size,
+            "image_path": image_paths,
+            "url": urls,
+            "tree": trees,
+            "warn_obs": warns,
+            "pdf_obs": pdfs,
+            "fail_obs": fails,
+            "action": [""] * batch_size,
+        })
+
+        # Emit chat-formatted messages for the LLM; rollout flattens and extracts images
+        messages_per_env = self.memory.build_message_history(history_length=3, max_images=3)
+        observations = {
+            'text': messages_per_env,
+            'image': None,
+            'anchor': obs_list
+        }
+        return observations, infos
+
+    def step(self, text_actions: List[str]):
+        actions, valids = self.projection_f(text_actions)
+        next_obs, rewards, dones, infos = self.envs.step(actions)
+
+        # Build next user messages (observation texts) and store together with assistant_text
+        next_user_texts: List[str] = []
+        images_batch: List[Any] = []
+        image_paths: List[Any] = []
+        urls: List[Any] = []
+        trees: List[Any] = []
+        warns: List[Any] = []
+        pdfs: List[Any] = []
+        fails: List[Any] = []
+
+        for obs in next_obs:
+            task_goal = obs.get('task_ques', '')
+            url = obs.get('url', '') # current url
+            tree = obs.get('ac_tree', '')
+            img_path = obs.get('image')
+            pdf_obs = obs.get('pdf_obs', '')
+
+            if pdf_obs:
+                user_text = WEBVOYAGER_PROMPT_TEMPLATE["pdf_observation"].format(
+                    task_goal=task_goal,
+                    pdf_obs=pdf_obs
+                )
+            else:
+                user_text = WEBVOYAGER_PROMPT_TEMPLATE["observation"].format(
+                    task_goal=task_goal,
+                    url=url,
+                    accessibility_tree=tree or ""
+                )
+
+            # if img_path:
+            #     user_text = user_text + "\n\n<image>"
+
+            next_user_texts.append(user_text)
+            images_batch.append([img_path] if img_path else None)
+            image_paths.append(img_path)
+            urls.append(url)
+            trees.append(tree)
+            warns.append(obs.get('warn_obs', ''))
+            pdfs.append(pdf_obs)
+            fails.append(obs.get('fail_obs', ''))
+
+        # Store assistant_text (raw model outputs) and the newly built user_texts
+        self.memory.store({
+            "user_text": next_user_texts,
+            "assistant_text": text_actions,
+            "image_path": image_paths,
+            "url": urls,
+            "tree": trees,
+            "warn_obs": warns,
+            "pdf_obs": pdfs,
+            "fail_obs": fails,
+            "action": text_actions,
+        })
+
+        # Emit chat-formatted messages for the LLM; rollout flattens and extracts images
+        messages_per_env = self.memory.build_message_history(history_length=3, max_images=3)
+        next_observations = {
+            'text': messages_per_env,
+            'image': None,
+            'anchor': next_obs
+        }
+
+        # add action_valid to infos
+        for i, info in enumerate(infos):
+            info['is_action_valid'] = to_numpy(valids[i])
+
+        rewards = to_numpy(rewards)
+        dones = to_numpy(dones)
+
+        return next_observations, rewards, dones, infos
+
+
+
+
 def make_envs(config):
     """
     Create enviroments 
@@ -856,6 +1003,17 @@ def make_envs(config):
         projection_f = partial(appworld_projection)
         envs = AppWorldEnvironmentManager(_envs, projection_f, config)
         val_envs = AppWorldEnvironmentManager(_val_envs, projection_f, config)
+        return envs, val_envs
+    elif "webvoyager" in config.env.env_name.lower():
+        from agent_system.environments.env_package.webvoyager import build_webvoyager_envs, webvoyager_projection
+        env_kwargs = {}
+        config_path = os.path.join(os.path.dirname(__file__), 'env_package/webvoyager/configs/configs.yaml')
+        _envs = build_webvoyager_envs(config_path, config.env.seed, config.data.train_batch_size, group_n, is_train=True, env_kwargs=env_kwargs, resources_per_worker=resources_per_worker)
+        _val_envs = build_webvoyager_envs(config_path, config.env.seed + 1000, config.data.val_batch_size, 1, is_train=False, env_kwargs=env_kwargs, resources_per_worker=resources_per_worker)
+        
+        projection_f = partial(webvoyager_projection)
+        envs = WebVoyagerEnvironmentManager(_envs, projection_f, config)
+        val_envs = WebVoyagerEnvironmentManager(_val_envs, projection_f, config)
         return envs, val_envs
     else:
         print("Environment not supported")
