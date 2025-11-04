@@ -1,10 +1,9 @@
 set -x
 
-N_GPUS=4
+N_GPUS=2
+CUDA_VISIBLE_DEVICES=2,3
 ENGINE=${1:-vllm}
 export VLLM_ATTENTION_BACKEND=FLASH_ATTN
-
-export WEBVOYAGER_DATA=$HOME/data/webvoyager
 
 num_cpus_per_env_worker=0.1 # The CPU resource allocated for each environment worker. If you want to use less CPU resources, you can decrease this value.
 
@@ -24,7 +23,7 @@ python3 -m verl.trainer.main_ppo \
     data.val_files=$HOME/data/verl-agent/text/test.parquet \
     data.train_batch_size=$train_data_size \
     data.val_batch_size=$val_data_size \
-    data.max_prompt_length=2048 \
+    data.max_prompt_length=10000 \
     data.max_response_length=512 \
     data.filter_overlong_prompts=True \
     data.truncation='error' \
@@ -49,16 +48,17 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.free_cache_engine=False \
     actor_rollout_ref.rollout.val_kwargs.temperature=0.4 \
     actor_rollout_ref.rollout.val_kwargs.do_sample=True \
+    actor_rollout_ref.rollout.max_num_batched_tokens=11000 \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=32 \
     actor_rollout_ref.ref.fsdp_config.param_offload=True \
     actor_rollout_ref.actor.use_invalid_action_penalty=True \
     actor_rollout_ref.actor.invalid_action_penalty_coef=0.1 \
     algorithm.use_kl_in_reward=False \
-    env.env_name=webgym/webvoyager \
+    env.env_name=webvoyager \
     env.seed=0 \
     env.prompt_type=vanilla \
     env.success_coef=0.0 \
-    env.max_steps=20 \
+    env.max_steps=10 \
     env.rollout.n=$group_size \
     env.history_length=4 \
     env.resources_per_worker.num_cpus=$num_cpus_per_env_worker \

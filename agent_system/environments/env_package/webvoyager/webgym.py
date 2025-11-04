@@ -14,6 +14,7 @@ from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.common.action_chains import ActionChains
+from selenium.webdriver.support.ui import WebDriverWait
 
 from .webvoyager.prompts import SYSTEM_PROMPT, SYSTEM_PROMPT_TEXT_ONLY
 from openai import OpenAI
@@ -41,7 +42,8 @@ class WebVoyagerEnv(gym.Env):
                  save_accessibility_tree: bool = True,
                  force_device_scale: bool = False,
                  batch_id: int = 0,
-                 num_containers_per_machine: int = 1):
+                 num_containers_per_machine: int = 1,
+                 worker_id: Optional[str] = None):
         """
         Initialize the WebVoyager environment.
         
@@ -84,6 +86,7 @@ class WebVoyagerEnv(gym.Env):
         self.batch_id = batch_id
         self.num_containers_per_machine = num_containers_per_machine
         self.url_mapping = []
+        self.worker_id = worker_id
         
         # Initialize OpenAI client
         self.client = OpenAI(api_key=api_key)
@@ -127,6 +130,10 @@ class WebVoyagerEnv(gym.Env):
             options.add_argument(
                 "--user-agent=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36"
             )
+        # Improve stability in headless/HPC environments
+        options.add_argument("--no-sandbox")
+        options.add_argument("--disable-dev-shm-usage")
+        options.add_argument("--disable-gpu")
         options.add_experimental_option(
             "prefs", {
                 "download.default_directory": self.download_dir,
@@ -156,6 +163,15 @@ class WebVoyagerEnv(gym.Env):
         # Initialize new driver
         self.driver = webdriver.Chrome(options=self.options)
         self.driver.set_window_size(self.window_width, self.window_height)
+        # Explicit timeouts
+        try:
+            self.driver.set_page_load_timeout(30)
+        except Exception:
+            pass
+        try:
+            self.driver.set_script_timeout(30)
+        except Exception:
+            pass
         
         # Store current task
         self.task = task
@@ -167,8 +183,16 @@ class WebVoyagerEnv(gym.Env):
             if os.path.isfile(file_path):
                 os.remove(file_path)
         
-        self.task_dir = os.path.join(self.download_dir, 'task{}'.format(task["id"]), 'batch_id{}'.format(self.batch_id))
-        os.makedirs(self.task_dir, exist_ok=True)
+        base_task_dir = os.path.join(self.download_dir, 'task{}'.format(task["id"]), 'batch_id{}'.format(self.batch_id))
+        os.makedirs(base_task_dir, exist_ok=True)
+
+        # Create a unique per-worker subdirectory under the task directory
+        wid = self.worker_id if self.worker_id is not None else f"pid{os.getpid()}_{int(time.time()*1000)%1000000}"
+        self.worker_dir = os.path.join(base_task_dir, f'worker_{wid}')
+        os.makedirs(self.worker_dir, exist_ok=True)
+
+        # Preserve base task directory for compatibility, but write files to worker_dir
+        self.task_dir = base_task_dir
 
         self.download_files = []
         self.fail_obs = ""
@@ -227,7 +251,7 @@ class WebVoyagerEnv(gym.Env):
             if not self.text_only:
                 rects, self.web_eles, self.web_eles_text = get_web_element_rect(self.driver, fix_color=self.fix_box_color)
             else:
-                accessibility_tree_path = os.path.join(self.task_dir, 'accessibility_tree{}'.format(self.timestep))
+                accessibility_tree_path = os.path.join(self.worker_dir, 'accessibility_tree{}'.format(self.timestep))
                 self.accessibility_tree, self.obs_info = get_webarena_accessibility_tree(self.driver, accessibility_tree_path)
 
         except Exception as e:
@@ -239,12 +263,17 @@ class WebVoyagerEnv(gym.Env):
                 self.fail_obs = "Driver error when obtaining accessibility tree."
             logging.error(e)
             
-        self.img_path = os.path.join(self.task_dir, 'screenshot{}.png'.format(self.timestep))
-        self.driver.save_screenshot(self.img_path)
+        self.img_path = os.path.join(self.worker_dir, 'screenshot{}.png'.format(self.timestep))
+        try:
+            self.driver.save_screenshot(self.img_path)
+        except Exception as e:
+            logging.error(f"Screenshot failed: {e}")
+            # Record failure but continue without crashing the worker
+            self.fail_obs = self.fail_obs or "Screenshot failed due to unresponsive browser."
 
         # accessibility tree
         if (not self.text_only) and self.save_accessibility_tree:
-            accessibility_tree_path = os.path.join(self.task_dir, 'accessibility_tree{}'.format(self.timestep))
+            accessibility_tree_path = os.path.join(self.worker_dir, 'accessibility_tree{}'.format(self.timestep))
             self.accessibility_tree, self.obs_info = get_webarena_accessibility_tree(self.driver, accessibility_tree_path)
         
         # Get initial observation
@@ -411,7 +440,7 @@ class WebVoyagerEnv(gym.Env):
             if not self.text_only:
                 rects, self.web_eles, self.web_eles_text = get_web_element_rect(self.driver, fix_color=self.fix_box_color)
             else:
-                accessibility_tree_path = os.path.join(self.task_dir, 'accessibility_tree{}'.format(self.timestep))
+                accessibility_tree_path = os.path.join(self.worker_dir, 'accessibility_tree{}'.format(self.timestep))
                 self.accessibility_tree, self.obs_info = get_webarena_accessibility_tree(self.driver, accessibility_tree_path)
 
         except Exception as e:
@@ -421,12 +450,12 @@ class WebVoyagerEnv(gym.Env):
                 logging.error('Driver error when obtaining accessibility tree.')
             logging.error(e)
             
-        self.img_path = os.path.join(self.task_dir, 'screenshot{}.png'.format(self.timestep))
+        self.img_path = os.path.join(self.worker_dir, 'screenshot{}.png'.format(self.timestep))
         self.driver.save_screenshot(self.img_path)
 
         # accessibility tree
         if (not self.text_only) and self.save_accessibility_tree:
-            accessibility_tree_path = os.path.join(self.task_dir, 'accessibility_tree{}'.format(self.timestep))
+            accessibility_tree_path = os.path.join(self.worker_dir, 'accessibility_tree{}'.format(self.timestep))
             self.accessibility_tree, self.obs_info = get_webarena_accessibility_tree(self.driver, accessibility_tree_path)
         
         # Get new observation
@@ -456,7 +485,7 @@ class WebVoyagerEnv(gym.Env):
         # we can append those we need
         observation = {
                 'image': self.img_path,
-                'ac_tree': self.accessibility_tree,
+                'ac_tree': self.accessibility_tree if (not self.text_only and self.save_accessibility_tree) else None,
                 'pdf_obs': self.pdf_obs,
                 'warn_obs': self.warn_obs,
                 'fail_obs': self.fail_obs,
@@ -467,6 +496,7 @@ class WebVoyagerEnv(gym.Env):
                 'starting_url': self.starting_url
         }
         return observation
+        
     
     def _exec_action_click(self, action, web_ele):
         self.driver.execute_script("arguments[0].setAttribute('target', '_self')", web_ele)

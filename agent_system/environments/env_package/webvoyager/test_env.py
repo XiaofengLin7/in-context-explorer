@@ -11,7 +11,11 @@ if test_gym_env:
             api_key="your-api-key-here",
             headless=True,
             text_only=False,
-            env_config=OmegaConf.load("agent_system/environments/env_package/webvoyager/configs/configs.yaml")
+            env_config=OmegaConf.load("agent_system/environments/env_package/webvoyager/configs/configs.yaml"),
+            save_accessibility_tree=True,
+            batch_id=0,
+            num_containers_per_machine=1,
+            worker_id=None
         )
 
     # Example task
