@@ -644,9 +644,9 @@ class WebVoyagerEnvironmentManager(EnvironmentManagerBase):
                 url=url,
                 accessibility_tree=tree or ""
             )
-            # Append a single image placeholder if we have a screenshot
-            #if img_path:
-            #    init_text = init_text + "\n\n<image>"
+            # # Append a single image placeholder if we have a screenshot
+            # if img_path:
+            #     init_text = init_text + "\n\n<image>"
 
             initial_user_texts.append(init_text)
             images_batch.append([img_path] if img_path else None)
@@ -711,8 +711,8 @@ class WebVoyagerEnvironmentManager(EnvironmentManagerBase):
                     accessibility_tree=tree or ""
                 )
 
-            #if img_path:
-            #    user_text = user_text + "\n\n<image>"
+            # if img_path:
+            #     user_text = user_text + "\n\n<image>"
 
             next_user_texts.append(user_text)
             images_batch.append([img_path] if img_path else None)
