@@ -94,7 +94,7 @@ class WebVoyagerMultiProcessEnv(gym.Env):
         self.num_processes = env_num * group_n
         self.is_train = is_train
         if not is_train: assert group_n == 1
-        self.config = OmegaConf.load("agent_system/environments/env_package/webvoyager/configs/configs.yaml")
+        self.config = OmegaConf.load(config_path)
         raw_path = self.config.dataset.train_data_path if is_train else self.config.dataset.test_data_path
         # Expand environment variables like $WEBVOYAGER_DATA in the path
         self.data_file = os.path.expandvars(raw_path)
