@@ -3,20 +3,16 @@ import gym
 import numpy as np
 import json
 import os
-import yaml
+from omegaconf import OmegaConf 
 from pprint import pprint
 
-def load_config_file(path):
-    assert os.path.exists(path), "Invalid config file"
-    with open(path) as reader:
-        config = yaml.safe_load(reader)
-    return config
 
 class WebVoyagerWorker:
-    def __init__(self, seed, data_file, env_kwargs):
+    def __init__(self, seed, data_file, env_config, env_kwargs):
         from .webgym import WebVoyagerEnv
         self.env = WebVoyagerEnv(
                     api_key="your-api-key-here",
+                    env_config=env_config,
                     headless=True,
                     text_only=False
                 )
@@ -98,8 +94,8 @@ class WebVoyagerMultiProcessEnv(gym.Env):
         self.num_processes = env_num * group_n
         self.is_train = is_train
         if not is_train: assert group_n == 1
-        self.config = load_config_file(config_path)
-        raw_path = self.config["dataset"]["train_data_path"] if is_train else self.config["dataset"]["test_data_path"]
+        self.config = OmegaConf.load("agent_system/environments/env_package/webvoyager/configs/configs.yaml")
+        raw_path = self.config.dataset.train_data_path if is_train else self.config.dataset.test_data_path
         # Expand environment variables like $WEBVOYAGER_DATA in the path
         self.data_file = os.path.expandvars(raw_path)
         self._rng = np.random.RandomState(seed)
@@ -115,7 +111,7 @@ class WebVoyagerMultiProcessEnv(gym.Env):
         env_worker = ray.remote(**resources_per_worker)(WebVoyagerWorker)
         self._workers = []
         for i in range(self.num_processes):
-            worker = env_worker.remote(seed + (i // self.group_n), self.data_file, self._env_kwargs)
+            worker = env_worker.remote(seed + (i // self.group_n), self.data_file, self.config, self._env_kwargs)
             self._workers.append(worker)
 
 
