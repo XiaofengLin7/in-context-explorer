@@ -384,6 +384,9 @@ class TrajectoryCollector:
             
             text_actions = self.tokenizer.batch_decode(batch.batch['responses'], skip_special_tokens=True)
             next_obs, rewards, dones, infos = envs.step(text_actions)
+            breakpoint()
+            ## verbose to check the first element of next_obs
+            # print(next_obs['text'][0])
 
             
             if len(rewards.shape) == 2:

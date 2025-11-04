@@ -1,6 +1,6 @@
 # Test if env works
 
-test_gym_env = False
+test_gym_env = True
 
 if test_gym_env:
     from webgym import WebVoyagerEnv
@@ -8,7 +8,7 @@ if test_gym_env:
     env = WebVoyagerEnv(
             api_key="your-api-key-here",
             headless=True,
-            text_only=False,
+            text_only=True,
         )
         
     # Example task

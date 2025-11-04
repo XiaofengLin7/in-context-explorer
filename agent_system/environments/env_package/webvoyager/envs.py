@@ -18,7 +18,7 @@ class WebVoyagerWorker:
         self.env = WebVoyagerEnv(
                     api_key="your-api-key-here",
                     headless=True,
-                    text_only=True
+                    text_only=False
                 )
         self.data_file = data_file
         self.tasks = []

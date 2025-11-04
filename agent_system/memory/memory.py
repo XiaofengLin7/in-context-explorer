@@ -14,6 +14,7 @@
 # limitations under the License.
 
 from typing import List, Dict, Any, Tuple, Optional
+import re
 from .base import BaseMemory
 
 class SimpleMemory(BaseMemory):
@@ -213,7 +214,7 @@ class WebVoyagerMemory(BaseMemory):
           - {'type': 'image', 'source': {'type': 'path', 'path': <str>}}
 
         Behavior:
-        - Only the last `history_length` records per env are included.
+        - All stored records per env are included (no truncation by history_length).
         - Older user messages are compressed to: "Observation omitted for previous steps. See attachment for screenshot."
         - A global cap of `max_images` images is applied per env, removing the
           oldest images first and cleaning the helper text accordingly.
@@ -230,7 +231,8 @@ class WebVoyagerMemory(BaseMemory):
         all_env_histories: List[List[Dict[str, Any]]] = []
 
         for env_idx in range(self.batch_size):
-            history_records = self._data[env_idx][-history_length:]
+            # Include all records to mirror environment behavior (do not drop prior user messages)
+            history_records = self._data[env_idx]
             messages: List[Dict[str, Any]] = []
 
             # Build alternating assistant -> user messages for each record when available
@@ -262,18 +264,23 @@ class WebVoyagerMemory(BaseMemory):
 
                 messages.append({"role": "user", "content": user_msg_content})
 
-            # Compress older user messages' text while keeping the newest intact
-            user_msg_indices = [i for i, m in enumerate(messages) if m.get("role") == "user"]
-            if len(user_msg_indices) > 1:
-                for idx in user_msg_indices[:-1]:
-                    content = messages[idx].get("content", [])
-                    if content and content[0].get("type") == "text":
-                        messages[idx]["content"][0][
-                            "text"
-                        ] = "Observation omitted for previous steps. See attachment for screenshot."
-
-            # Apply image clipping across all user messages
-            messages = self._clip_images(messages, max_images)
+            # Apply clipping only to history before the latest user message.
+            # The most recent user message should never be clipped, matching the
+            # environment's behavior (clip before appending new).
+            last_user_idx = None
+            for i in range(len(messages) - 1, -1, -1):
+                if messages[i].get("role") == "user":
+                    last_user_idx = i
+                    break
+            should_clip = len(messages) >= 3
+            if should_clip:
+                if last_user_idx is not None and last_user_idx > 0:
+                    history_msgs = messages[:last_user_idx]
+                    latest_msgs = messages[last_user_idx:]
+                    clipped_history = self._clip_messages_like_env(history_msgs, max_images)
+                    messages = clipped_history + latest_msgs
+                else:
+                    messages = self._clip_messages_like_env(messages, max_images)
 
             # ANSWER double-check guard: if previous assistant message (immediately
             # before the newest user message) contains ANSWER, append guidance
@@ -358,6 +365,72 @@ class WebVoyagerMemory(BaseMemory):
                     )
                     messages[i]["content"][0]["text"] = cleaned
                 removed += 1
+
+        return messages
+
+    def _clip_messages_like_env(self, messages: List[Dict[str, Any]], max_images: int) -> List[Dict[str, Any]]:
+        """
+        Rewrite user message texts to an omitted placeholder and enforce a max
+        number of attached images, mirroring the environment's clip behavior.
+
+        Rules:
+        - For each user message's text block:
+          - If it already contains "Observation omitted for previous steps.", leave it.
+          - If it contains "Now solve the following task.", trim everything from
+            "Screenshot of current viewpoint:" onward, then replace the whole text
+            with the omitted placeholder.
+          - Otherwise, replace with the omitted placeholder.
+        - Count all image blocks across user messages. If over `max_images`,
+          delete images in chronological order and remove the helper suffix
+          "See attachment for screenshot." from the corresponding text block.
+        """
+        OMITTED = "Observation omitted for previous steps. See attachment for screenshot."
+
+        # First pass: rewrite texts and count images
+        img_count = 0
+        for i, msg in enumerate(messages):
+            if msg.get('role') != 'user':
+                continue
+            content = msg.get('content', [])
+            for j, item in enumerate(content):
+                if item.get('type') == 'text':
+                    text = content[j].get('text', '')
+                    if "Observation omitted for previous steps." in text:
+                        continue
+                    if "Now solve the following task." in text:
+                        # If present, trim up to before the screenshot indicator
+                        m = re.search(r"Screenshot of current viewpoint:", text)
+                        if m:
+                            messages[i]['content'][j]['text'] = text[: m.start()] + OMITTED
+                        else:
+                            messages[i]['content'][j]['text'] = OMITTED
+                    else:
+                        messages[i]['content'][j]['text'] = OMITTED
+                elif item.get('type') and 'image' in item.get('type'):
+                    img_count += 1
+
+        # Second pass: clip images if exceeding max_images
+        if img_count > max_images:
+            to_remove = img_count - max_images
+            for i, msg in enumerate(messages):
+                if to_remove <= 0:
+                    break
+                if msg.get('role') != 'user':
+                    continue
+                content = msg.get('content', [])
+                k = 0
+                while k < len(content) and to_remove > 0:
+                    if content[k].get('type') and 'image' in content[k].get('type'):
+                        del content[k]
+                        to_remove -= 1
+                        # Clean helper suffix in the leading text block if present
+                        if content and content[0].get('type') == 'text':
+                            cleaned = content[0]['text'].replace(
+                                'See attachment for screenshot.', ''
+                            ).strip()
+                            content[0]['text'] = cleaned
+                        continue
+                    k += 1
 
         return messages
 
