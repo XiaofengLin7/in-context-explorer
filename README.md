@@ -5,6 +5,7 @@ For alfworld installation, please refer to README-verl-agent.md.
 git submodule update --init --recursive
 conda activate verl-agent # activate your previous installed conda env following README-verl-agent.md
 pip install -r agent_system/environments/env_package/webvoyager/webvoyager/requirements.txt
+pip install selenium==4.15.2
 ```
 Test your webvoyager
 ```

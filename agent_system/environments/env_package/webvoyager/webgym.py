@@ -69,7 +69,7 @@ class WebVoyagerEnv(gym.Env):
         self.api_model = api_model # to process pdf files
         
         self.env_config = env_config
-        if self.env_config.webarena:
+        if self.env_config.get("webarena", False):
             self.webarena_host = env_config.webarena_host
         else:
             self.webarena_host = None
@@ -202,9 +202,13 @@ class WebVoyagerEnv(gym.Env):
         # Initialize URL mapping
         self.url_mapping = [(task['web'], task['web'])]
         url = task['web']
+        # breakpoint()
         # Handle WebArena login if needed (do this before creating messages)
         if self.webarena_host and task.get('web_name') and task['web_name'] in WEBARENA_DOMAINS:
-            url = url.replace("ec2-98-81-119-107.compute-1.amazonaws.com", self.env_config.common_webarena_host) # replace the starting url with host server
+            if "ec2-98-81-119-107.compute-1.amazonaws.com" in url:
+                url = url.replace("ec2-98-81-119-107.compute-1.amazonaws.com", self.env_config.common_webarena_host) # replace the starting url with host server
+            if "192.222.54.137" in url:
+                url = url.replace("192.222.54.137", self.env_config.common_webarena_host) # replace the starting url with host server
             # Replace reddit references in task question (similar to webgym implementation)
             if task['web_name'] == 'reddit':
                 task['ques'] = task['ques'].replace("subreddit", "subforum").replace("sub-reddit", "subforum").replace("reddit", "postmill").replace("Reddit", "Postmill")

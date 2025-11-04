@@ -1,7 +1,4 @@
-dataset:
-  train_data_path: "$WEBVOYAGER_DATA/TTI_WebVoyager_train_data.jsonl"
-  test_data_path: "$WEBVOYAGER_DATA/WebVoyager_data.jsonl"
-webarena: True
+webarena: true
 common_webarena_host: "ec2-3-136-229-169.us-east-2.compute.amazonaws.com"
 webarena_host:
       reddit: ${common_webarena_host} 
@@ -10,3 +7,7 @@ webarena_host:
       map: ${common_webarena_host}
       shopping: ${common_webarena_host}
 
+# for now we will use tti tasks for webarena
+dataset:
+  train_data_path: "$WEBARENA_DATA/webarena_train_data.jsonl"
+  test_data_path: "$WEBARENA_DATA/webarena_test_data.jsonl"
