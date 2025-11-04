@@ -1,13 +1,17 @@
 set -x
 ENGINE=${1:-vllm}
 export VLLM_ATTENTION_BACKEND=XFORMERS
-
+export HYDRA_FULL_ERROR=1
 num_cpus_per_env_worker=0.1 # The CPU resource allocated for each environment worker. If you want to use less CPU resources, you can decrease this value.
 
 train_data_size=16
 val_data_size=128
 group_size=8
-
+N_GPUS=4
+success_coef=0
+prompt_type=summary
+history_length=15
+experiment_name=grpo_qwen2.5_1.5b_success_coef_${success_coef}_prompt_type_${prompt_type}_history_length_${history_length}
 # We only use data preparation to indicate the modality and the data size.
 python3 -m examples.data_preprocess.prepare \
     --mode 'text' \
@@ -20,7 +24,7 @@ python3 -m verl.trainer.main_ppo \
     data.val_files=$HOME/data/verl-agent/text/test.parquet \
     data.train_batch_size=$train_data_size \
     data.val_batch_size=$val_data_size \
-    data.max_prompt_length=4096 \
+    data.max_prompt_length=7500 \
     data.max_response_length=512 \
     data.filter_overlong_prompts=True \
     data.truncation='error' \
@@ -37,7 +41,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.fsdp_config.param_offload=False \
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=False \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=16 \
-    actor_rollout_ref.rollout.tensor_model_parallel_size=2 \
+    actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
     actor_rollout_ref.rollout.name=$ENGINE \
     actor_rollout_ref.rollout.gpu_memory_utilization=0.6 \
     actor_rollout_ref.rollout.enable_chunked_prefill=False \
@@ -53,15 +57,18 @@ python3 -m verl.trainer.main_ppo \
     env.env_name=Webshop \
     env.seed=0 \
     env.max_steps=15 \
+    env.success_coef=${success_coef} \
+    env.prompt_type=${prompt_type} \
+    env.history_length=${history_length} \
     env.rollout.n=$group_size \
     env.resources_per_worker.num_cpus=$num_cpus_per_env_worker \
     trainer.critic_warmup=0 \
     trainer.logger=['console','wandb'] \
     trainer.project_name='verl_agent_webshop' \
-    trainer.experiment_name='grpo_qwen2.5_1.5b' \
-    trainer.n_gpus_per_node=2 \
+    trainer.experiment_name=${experiment_name} \
+    trainer.n_gpus_per_node=$N_GPUS \
     trainer.nnodes=1 \
-    trainer.save_freq=-1 \
+    trainer.save_freq=300 \
     trainer.test_freq=5 \
-    trainer.total_epochs=150 \
-    trainer.val_before_train=True $@
+    trainer.total_epochs=300 \
+    trainer.val_before_train=False $@

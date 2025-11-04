@@ -410,6 +410,8 @@ class TrajectoryCollector:
             assert len(rewards) == batch_size, f"env should return rewards for all environments, got {len(rewards)} rewards for {batch_size} environments"
             batch.non_tensor_batch['rewards'] = torch_to_numpy(rewards, is_object=True)
             batch.non_tensor_batch['active_masks'] = torch_to_numpy(active_masks, is_object=True)
+            # Record the per-timestep index for ordering within each trajectory during later aggregation/logging
+            batch.non_tensor_batch['step_idx'] = np.array([_step for _ in range(batch_size)], dtype=np.int32)
             
             # Update episode lengths for active environments
             batch_list: list[dict] = to_list_of_dict(batch)
@@ -435,18 +437,18 @@ class TrajectoryCollector:
                     episode_lengths=episode_lengths,
                     )
         
-        # Apply ALFWorld-specific trajectory reward shaping if applicable:
+        # Apply ALFWorld/WebShop-specific trajectory reward shaping if applicable:
         # desired: episode_reward = -T + 30 * I_success
         # where T is episode_lengths, I_success is 1.0 if success else 0.0
         success_coef = float(getattr(self.config.env, "success_coef", 30.0))
         if success_coef != 0.0:
-            if "alfworld" in self.config.env.env_name.lower():
+            if "alfworld" in self.config.env.env_name.lower() or "webshop" in self.config.env.env_name.lower():
                 success_rate = success.get("success_rate")
                 if success_rate is not None:
                     # ensure numpy arrays
                     success_indicator = np.array(success_rate, dtype=np.float32)
                     T = np.array(episode_lengths, dtype=np.float32)
-                    episode_rewards = -T + success_coef * success_indicator
+                    episode_rewards = (-T + success_coef) * success_indicator
 
 
         return total_batch_list, episode_rewards, episode_lengths, success, traj_uid, tool_callings

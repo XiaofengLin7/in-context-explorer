@@ -662,6 +662,114 @@ class RayPPOTrainer:
 
         print(f"Dumped generations to {filename}")
 
+    def _dump_val_trajectories(self, batch: DataProto, dump_path: str) -> None:
+        """Dump full validation trajectories to a JSONL file.
+
+        Each line contains one trajectory with summary fields and all its steps.
+
+        Args:
+            batch (DataProto): Collated step-level batch returned by trajectory collector.
+            dump_path (str): Directory to write the JSONL file.
+        """
+        os.makedirs(dump_path, exist_ok=True)
+        filename = os.path.join(dump_path, f"val_{self.global_steps}.jsonl")
+
+        # Build trajectories grouped by traj_uid
+        trajs: dict[str, dict] = {}
+
+        # Convenience references
+        batch_size = len(batch)
+        prompts = batch.batch["prompts"]
+        responses = batch.batch["responses"]
+        non_tensor = batch.non_tensor_batch
+
+        def _to_float(x):
+            try:
+                return float(x)
+            except Exception:
+                try:
+                    return x.item()  # type: ignore[attr-defined]
+                except Exception:
+                    return None
+
+        for i in range(batch_size):
+            traj_id = str(non_tensor["traj_uid"][i])
+            step_idx = int(non_tensor.get("step_idx", np.array([i]))[i])
+            prompt_text = self.tokenizer.decode(prompts[i], skip_special_tokens=True)
+            response_text = self.tokenizer.decode(responses[i], skip_special_tokens=True)
+
+            # Initialize trajectory container
+            if traj_id not in trajs:
+                # Collect per-trajectory summary fields from this first occurrence
+                summary: dict[str, float | int | str] = {}
+                # Optional fields copied per step; values are constant per trajectory
+                for key in [
+                    "episode_rewards",
+                    "episode_lengths",
+                    "tool_callings",
+                ]:
+                    if key in non_tensor:
+                        summary[key] = _to_float(non_tensor[key][i])  # type: ignore[assignment]
+                # Success metrics (keys containing 'success_rate')
+                for key, arr in non_tensor.items():
+                    if isinstance(key, str) and "success_rate" in key:
+                        summary[key] = _to_float(arr[i])  # type: ignore[assignment]
+
+                data_source = None
+                if "data_source" in non_tensor:
+                    data_source = str(non_tensor["data_source"][i])
+
+                trajs[traj_id] = {
+                    "traj_uid": traj_id,
+                    "data_source": data_source,
+                    **summary,
+                    "steps": [],
+                }
+
+            trajs[traj_id]["steps"].append(
+                {
+                    "step": step_idx,
+                    "prompt": prompt_text,
+                    "response": response_text,
+                }
+            )
+
+        # Sort steps within each trajectory by step index
+        for traj in trajs.values():
+            traj["steps"].sort(key=lambda x: x["step"])  # type: ignore[index]
+
+        # Limit the number of trajectories stored per file
+        max_traj_per_file = 10
+        selected_trajs = list(trajs.values())
+        if max_traj_per_file > 0 and len(selected_trajs) > max_traj_per_file:
+            try:
+                # Deterministic selection: sort by traj_uid when present
+                selected_trajs.sort(key=lambda t: t.get("traj_uid", ""))
+            except Exception:
+                pass
+            selected_trajs = selected_trajs[:max_traj_per_file]
+
+        # Append up to N trajectories per validation step
+        with open(filename, "a", encoding="utf-8") as f:
+            for traj in selected_trajs:
+                f.write(json.dumps(traj, ensure_ascii=False) + "\n")
+
+        print(f"Dumped validation trajectories to {filename}")
+
+        # Upload to tracking backends if configured
+        try:
+            if hasattr(self, "tracking") and self.tracking is not None:
+                self.tracking.log_artifact(
+                    file_path=filename,
+                    artifact_path="val_trajectories",
+                    artifact_name=f"val_trajs_step_{self.global_steps}",
+                    artifact_type="dataset",
+                )
+        except Exception as e:
+            print(f"WARNING: failed to upload validation trajectories: {e}")
+
+        # Note: per-file trajectory count is limited; we no longer prune files here.
+
     def _maybe_log_val_generations(self, inputs, outputs, scores):
         """Log a table of validation samples to the configured logger (wandb or swanlab)"""
 
@@ -691,6 +799,7 @@ class RayPPOTrainer:
         data_source_lst = []
         tool_calling_list = []
         traj_uid_list = []
+        episode_length_list = []
         success_rate_dict = {}
 
         # Lists to collect samples for the table
@@ -753,6 +862,17 @@ class RayPPOTrainer:
                                                     is_train=False,
                                                     )
             print('validation generation end')
+            # Optionally dump full validation trajectories
+            val_traj_dir = self.config.trainer.get("val_trajectory_dir", None)
+            if val_traj_dir:
+                try:
+                    # Resolve relative paths to absolute, using current working directory
+                    if not os.path.isabs(val_traj_dir):
+                        working_dir = os.getcwd()
+                        val_traj_dir = os.path.join(working_dir, val_traj_dir)
+                    self._dump_val_trajectories(batch=test_output_gen_batch, dump_path=val_traj_dir)
+                except Exception as e:
+                    print(f"WARNING: failed to dump validation trajectories due to error: {e}")
             del test_batch
             test_batch = test_output_gen_batch
             # Store generated outputs
@@ -772,6 +892,8 @@ class RayPPOTrainer:
             data_source_lst.append(test_batch.non_tensor_batch.get('data_source', ['unknown'] * reward_tensor.shape[0]))
             tool_calling_list.append(test_output_gen_batch.non_tensor_batch['tool_callings'])
             traj_uid_list.append(test_output_gen_batch.non_tensor_batch['traj_uid'])
+            if 'episode_lengths' in test_output_gen_batch.non_tensor_batch:
+                episode_length_list.append(test_output_gen_batch.non_tensor_batch['episode_lengths'])
             # success rate
             for k in test_batch.non_tensor_batch.keys():
                 if 'success_rate' in k:
@@ -789,6 +911,9 @@ class RayPPOTrainer:
         tool_callings = np.concatenate(tool_calling_list, axis=0)
         traj_uids = np.concatenate(traj_uid_list, axis=0)
         success_rate = {k: np.mean(v) for k, v in success_rate_dict.items()}
+        episode_lengths = None
+        if len(episode_length_list) > 0:
+            episode_lengths = np.concatenate(episode_length_list, axis=0)
 
         # evaluate test_score based on data source
         data_source_reward = {}
@@ -822,6 +947,12 @@ class RayPPOTrainer:
 
         for k, v in success_rate.items():
             metric_dict[f'val/{k}'] = v
+
+        # Log a single scalar for validation episode length averaged over unique trajectories
+        if episode_lengths is not None:
+            metric_dict['val/episode_length/mean'] = float(np.mean(episode_lengths[unique_idx]))
+            metric_dict['val/episode_length/max'] = float(np.max(episode_lengths[unique_idx]))
+            metric_dict['val/episode_length/min'] = float(np.min(episode_lengths[unique_idx]))
 
         return metric_dict
 
@@ -1021,6 +1152,9 @@ class RayPPOTrainer:
             default_backend=self.config.trainer.logger,
             config=OmegaConf.to_container(self.config, resolve=True),
         )
+
+        # Expose tracking logger to other methods for artifact uploads
+        self.tracking = logger
 
         self.global_steps = 0
 
