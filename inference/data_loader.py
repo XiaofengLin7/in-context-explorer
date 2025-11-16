@@ -94,6 +94,7 @@ def iter_steps_from_jsonl(
     traj_key: str = "traj_uid",
     steps_key: str = "steps",
     prompt_key: str = "prompt",
+    response_key: str = "response",
 ) -> Generator[Dict[str, Any], None, None]:
     """
     Yields per-step records as:
@@ -117,6 +118,6 @@ def iter_steps_from_jsonl(
             if prompt is None or not isinstance(prompt, str):
                 continue
             msgs = wrap_prompt_to_messages(prompt)
-            yield {"traj_uid": traj_uid, "step": step_id, "messages": msgs}
+            yield {"traj_uid": traj_uid, "step": step_id, "messages": msgs, "student_response": st.get(response_key)}
 
 

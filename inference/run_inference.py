@@ -85,7 +85,7 @@ def main() -> None:
 
         if args.data_path and os.path.exists(args.data_path):
             for rec in iter_steps_from_jsonl(args.data_path):
-                meta.append({"traj_uid": rec.get("traj_uid"), "step": rec.get("step")})
+                meta.append({"traj_uid": rec.get("traj_uid"), "step": rec.get("step"), "student_response": rec.get("student_response")})
                 inputs.append(rec["messages"])
         else:
             raise SystemExit("data_path must be provided (via env DATA_PATH or --data-path)")
@@ -107,13 +107,14 @@ def main() -> None:
         response_key = f"{model_name}_response"
         reasoning_key = f"{model_name}_reasoning"
         results_jsonl = []
-        for i, input, out in zip(inputs, out_list):
+        for idx, (input_messages, out) in enumerate(zip(inputs, out_list)):
             record = {
-                "traj_uid": meta[i].get("traj_uid") if i < len(meta) else None,
-                "step": meta[i].get("step") if i < len(meta) else None,
+                "traj_uid": meta[idx].get("traj_uid") if idx < len(meta) else None,
+                "step": meta[idx].get("step") if idx < len(meta) else None,
                 response_key: out.get("text", ""),
                 reasoning_key: out.get("reasoning", ""),
-                "input_messages": input,
+                "input_messages": input_messages,
+                "student_response": meta[idx].get("student_response") if idx < len(meta) else None,
             }
             results_jsonl.append(record)
 
