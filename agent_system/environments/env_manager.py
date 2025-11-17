@@ -24,6 +24,7 @@ from agent_system.environments.base import EnvironmentManagerBase, to_numpy
 from agent_system.memory import SimpleMemory, SearchMemory, WebVoyagerMemory
 from omegaconf import OmegaConf
 import re
+from agent_system.environments.env_package.alfworld.alfworld.gen.constants import OPENABLE_CLASS_SET
 
 def extract_known_and_unknown(responses: List[str]) -> Tuple[List[str], List[str]]:
     """
@@ -207,9 +208,12 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
         # initialize the history buffer
         self.memory.reset(batch_size = len(text_obs))
         self.tasks = []
+        self.visited_receptacles = [set() for _ in range(len(text_obs))]
         self.pre_text_obs = text_obs
         self.extract_task(text_obs)
-
+        self.receptacles = self.extract_receptacles(self.envs.get_admissible_commands)
+        # Initialize unvisited_receptacles as a copy of all receptacles
+        self.unvisited_receptacles = [receptacle_set.copy() for receptacle_set in self.receptacles]
         full_text_obs = self.build_text_obs(text_obs, self.envs.get_admissible_commands, init=True)
         return {'text': full_text_obs, 'image': image_obs, 'anchor': text_obs}, infos
     
@@ -221,6 +225,7 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
         text_obs, image_obs, rewards, dones, infos = self.envs.step(actions)
         self.memory.store({'text_obs': self.pre_text_obs, 'action': actions})
         self.pre_text_obs = text_obs
+        self.update_receptacles(text_obs, actions)
         if self.keep_known_and_unknown:
             full_text_obs = self.build_text_obs_with_known_and_unknown(text_obs, self.envs.get_admissible_commands, known_information, unknown_information)
         else:
@@ -239,6 +244,47 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
 
         return next_observations, rewards, dones, infos
     
+    def normalize_receptacle(self, receptacle: str) -> str:
+        """
+        Normalize receptacle name to format: receptacle_class + one space + num_id.
+        
+        Input can have receptacle_class + multiple spaces (0 to many) + num_id.
+        This function normalizes it to exactly one space between class and ID.
+        
+        Args:
+            receptacle: Receptacle name (e.g., "dresser  1", "shelf5", "drawer   1")
+            
+        Returns:
+            Normalized receptacle name with exactly one space (e.g., "dresser 1", "shelf 5", "drawer 1")
+        """
+        # Match letters (receptacle class) + zero or more spaces + digits (num_id)
+        # Replace with receptacle_class + one space + num_id
+        normalized = re.sub(r'([a-zA-Z]+)\s*(\d+)', r'\1 \2', receptacle)
+        return normalized
+    
+    def is_openable_receptacle(self, receptacle: str) -> bool:
+        for openable_receptacle in OPENABLE_CLASS_SET:
+            if openable_receptacle.lower() in receptacle.lower():
+                return True
+        return False
+
+    def update_receptacles(self, text_obs: List[str], actions: List[str]):
+        for i, action in enumerate(actions):
+            if "go to" in action:
+                receptacle = action.split("go to ")[1]
+                receptacle = self.normalize_receptacle(receptacle)
+                if self.is_openable_receptacle(receptacle):
+                    continue
+                if receptacle in text_obs[i] and receptacle in self.receptacles[i]:
+                    self.visited_receptacles[i].add(receptacle)
+                    self.unvisited_receptacles[i].discard(receptacle)
+            elif "open" in action:
+                receptacle = action.split("open ")[1]
+                receptacle = self.normalize_receptacle(receptacle)
+                if self.is_openable_receptacle(receptacle) and "is open" in text_obs[i] and receptacle in self.receptacles[i]:
+                    self.visited_receptacles[i].add(receptacle)
+                    self.unvisited_receptacles[i].discard(receptacle)
+    
     def extract_task(self, text_obs: List[str]):
         for obs in text_obs:
             task_start = obs.find('Your task is to: ')
@@ -247,8 +293,17 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
                 self.tasks.append(obs[task_start + len('Your task is to: '):].strip())
             else:
                 raise ValueError("Task description not found in text observation.")
-    
 
+    def extract_receptacles(self, admissible_actions: List[List[str]])->List[List[str]]:
+        receptacles = []
+        for actions in admissible_actions:
+            current_receptacle = set()
+            for action in actions:
+                if "go to" in action:
+                    current_receptacle.add(action.split("go to ")[1])
+            receptacles.append(current_receptacle)
+        return receptacles
+        
     def build_text_obs(self, text_obs: List[str], admissible_actions: List[List[str]], init: bool = False) -> List[str]:
         """
         This function builds the text observation for the agent.
