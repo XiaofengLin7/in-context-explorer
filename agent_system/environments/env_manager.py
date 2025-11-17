@@ -71,7 +71,7 @@ def extract_known_and_unknown(responses: List[str]) -> Tuple[List[str], List[str
 
     return known_information, unknown_information
 
-def select_prompt_variant(config, vanilla_init: str, vanilla_history: str, summary_init: str, summary_history: str) -> Tuple[str, str, bool]:
+def select_prompt_variant(config, vanilla_init: str, vanilla_history: str, summary_init: str, summary_history: str, gold_init: str, gold_history: str) -> Tuple[str, str, bool]:
     """
     Return (prompt_init, prompt_history, keep_known_and_unknown) based on config.env.prompt_type.
     """
@@ -80,6 +80,8 @@ def select_prompt_variant(config, vanilla_init: str, vanilla_history: str, summa
         return summary_init, summary_history, True
     if prompt_type == 'vanilla':
         return vanilla_init, vanilla_history, False
+    if prompt_type == 'gold':
+        return gold_init, gold_history, False
     raise ValueError(f"Invalid prompt type: {config.env.prompt_type}")
 
 def parse_gamefile(infos):
@@ -199,6 +201,8 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
             ALFWORLD_TEMPLATE,
             ALFWORLD_TEMPLATE_NO_HIS_SUMMARY,
             ALFWORLD_TEMPLATE_SUMMARY,
+            ALFWORLD_TEMPLATE_NO_HIS,
+            ALFWORLD_TEMPLATE_GOLD
         )
         super().__init__(envs, projection_f, config)
     
@@ -229,7 +233,10 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
         if self.keep_known_and_unknown:
             full_text_obs = self.build_text_obs_with_known_and_unknown(text_obs, self.envs.get_admissible_commands, known_information, unknown_information)
         else:
-            full_text_obs = self.build_text_obs(text_obs, self.envs.get_admissible_commands)
+            if self.config.env.prompt_type == 'gold':
+                full_text_obs = self.build_text_obs_gold(text_obs, self.envs.get_admissible_commands)
+            else:
+                full_text_obs = self.build_text_obs(text_obs, self.envs.get_admissible_commands)
 
         if infos[0].get("extra.gamefile") is None:
             infos = set_gamefile(infos, self.gamefile)
@@ -338,9 +345,9 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
             postprocess_text_obs.append(obs)
         return postprocess_text_obs
     
-    def build_text_obs_with_known_and_unknown(self, text_obs: List[str], admissible_actions: List[List[str]], known_information: List[str], unknown_information: List[str]) -> List[str]:
+    def build_text_obs_with_known_and_unknown(self, text_obs: List[str], admissible_actions: List[List[str]], known_information: List[str], unknown_information: List[str], init: bool = False) -> List[str]:
         postprocess_text_obs = []
-        if self.config.env.history_length > 0:
+        if not init or self.config.env.history_length > 0:
             memory_contexts, valid_lens = self.memory.fetch(
                     self.config.env.history_length,
                     obs_key="text_obs",
@@ -350,7 +357,7 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
             # exclude 'help' in admissible_actions[i]
             reformatted_admissible_actions = "\n ".join(f"'{s}'" for s in admissible_actions[i] if s != 'help')
 
-            if self.config.env.history_length <= 0:
+            if init or self.config.env.history_length <= 0:
                 obs = self.prompt_init.format(
                     current_observation=text_obs[i],
                     admissible_actions=reformatted_admissible_actions
@@ -370,7 +377,42 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
 
             postprocess_text_obs.append(obs)
         return postprocess_text_obs
+    
+    def build_text_obs_gold(self, text_obs: List[str], admissible_actions: List[List[str]], init: bool = False) -> List[str]:
+        postprocess_text_obs = []
+        if not init or self.config.env.history_length > 0:
+            memory_contexts, valid_lens = self.memory.fetch(
+                    self.config.env.history_length,
+                    obs_key="text_obs",
+                    action_key="action")
 
+        for i in range(len(text_obs)):
+            # exclude 'help' in admissible_actions[i]
+            reformatted_admissible_actions = "\n ".join(f"'{s}'" for s in admissible_actions[i] if s != 'help')
+
+            visited_receptacles = ", ".join(sorted(list(self.visited_receptacles[i])))
+            unvisited_receptacles = ", ".join(sorted(list(self.unvisited_receptacles[i])))
+
+            if init or self.config.env.history_length <= 0:
+                obs = self.prompt_init.format(
+                    task_description=self.tasks[i],
+                    admissible_actions=reformatted_admissible_actions
+                )
+            else:
+                obs = self.prompt_history.format(
+                    task_description=self.tasks[i],
+                    admissible_actions=reformatted_admissible_actions,
+                    step_count=len(self.memory[i]),
+                    history_length=valid_lens[i],
+                    action_history=memory_contexts[i],
+                    current_step=len(self.memory[i]) + 1,
+                    current_observation=text_obs[i],
+                    visited_receptacles=visited_receptacles,
+                    unvisited_receptacles=unvisited_receptacles
+                )
+
+            postprocess_text_obs.append(obs)
+        return postprocess_text_obs
     def _process_batch(self, batch_idx, total_batch_list, total_infos, success):
         # Find the last entry with active masks
         for i in reversed(range(len(total_batch_list[batch_idx]))):
