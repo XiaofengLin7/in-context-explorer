@@ -24,6 +24,7 @@ from agent_system.environments.base import EnvironmentManagerBase, to_numpy
 from agent_system.memory import SimpleMemory, SearchMemory, WebVoyagerMemory
 from omegaconf import OmegaConf
 import re
+from agent_system.environments.env_package.alfworld.alfworld.gen.constants import OPENABLE_CLASS_SET
 
 def extract_known_and_unknown(responses: List[str]) -> Tuple[List[str], List[str]]:
     """
@@ -70,7 +71,7 @@ def extract_known_and_unknown(responses: List[str]) -> Tuple[List[str], List[str
 
     return known_information, unknown_information
 
-def select_prompt_variant(config, vanilla_init: str, vanilla_history: str, summary_init: str, summary_history: str) -> Tuple[str, str, bool]:
+def select_prompt_variant(config, vanilla_init: str, vanilla_history: str, summary_init: str, summary_history: str, gold_init: str, gold_history: str) -> Tuple[str, str, bool]:
     """
     Return (prompt_init, prompt_history, keep_known_and_unknown) based on config.env.prompt_type.
     """
@@ -79,6 +80,8 @@ def select_prompt_variant(config, vanilla_init: str, vanilla_history: str, summa
         return summary_init, summary_history, True
     if prompt_type == 'vanilla':
         return vanilla_init, vanilla_history, False
+    if prompt_type == 'gold':
+        return gold_init, gold_history, False
     raise ValueError(f"Invalid prompt type: {config.env.prompt_type}")
 
 def parse_gamefile(infos):
@@ -198,6 +201,8 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
             ALFWORLD_TEMPLATE,
             ALFWORLD_TEMPLATE_NO_HIS_SUMMARY,
             ALFWORLD_TEMPLATE_SUMMARY,
+            ALFWORLD_TEMPLATE_NO_HIS,
+            ALFWORLD_TEMPLATE_GOLD
         )
         super().__init__(envs, projection_f, config)
     
@@ -207,10 +212,18 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
         # initialize the history buffer
         self.memory.reset(batch_size = len(text_obs))
         self.tasks = []
+        self.visited_receptacles = [set() for _ in range(len(text_obs))]
         self.pre_text_obs = text_obs
         self.extract_task(text_obs)
-
-        full_text_obs = self.build_text_obs(text_obs, self.envs.get_admissible_commands, init=True)
+        self.receptacles = self.extract_receptacles(self.envs.get_admissible_commands)
+        # Initialize unvisited_receptacles as a copy of all receptacles
+        self.unvisited_receptacles = [receptacle_set.copy() for receptacle_set in self.receptacles]
+        if self.config.env.prompt_type == 'gold':
+            full_text_obs = self.build_text_obs_gold(text_obs, self.envs.get_admissible_commands, init=True)
+        elif self.config.env.prompt_type == 'summary':
+            full_text_obs = self.build_text_obs_with_known_and_unknown(text_obs, self.envs.get_admissible_commands, [], [],init=True)
+        else:
+            full_text_obs = self.build_text_obs(text_obs, self.envs.get_admissible_commands, init=True)
         return {'text': full_text_obs, 'image': image_obs, 'anchor': text_obs}, infos
     
     def step(self, text_actions: List[str]):
@@ -221,10 +234,14 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
         text_obs, image_obs, rewards, dones, infos = self.envs.step(actions)
         self.memory.store({'text_obs': self.pre_text_obs, 'action': actions})
         self.pre_text_obs = text_obs
+        self.update_receptacles(text_obs, actions)
         if self.keep_known_and_unknown:
             full_text_obs = self.build_text_obs_with_known_and_unknown(text_obs, self.envs.get_admissible_commands, known_information, unknown_information)
         else:
-            full_text_obs = self.build_text_obs(text_obs, self.envs.get_admissible_commands)
+            if self.config.env.prompt_type == 'gold':
+                full_text_obs = self.build_text_obs_gold(text_obs, self.envs.get_admissible_commands)
+            else:
+                full_text_obs = self.build_text_obs(text_obs, self.envs.get_admissible_commands)
 
         if infos[0].get("extra.gamefile") is None:
             infos = set_gamefile(infos, self.gamefile)
@@ -239,6 +256,53 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
 
         return next_observations, rewards, dones, infos
     
+    def normalize_receptacle(self, receptacle: str) -> str:
+        """
+        Normalize receptacle name to format: receptacle_class + one space + num_id.
+        
+        Input can have receptacle_class + multiple spaces (0 to many) + num_id.
+        This function normalizes it to exactly one space between class and ID.
+        
+        Args:
+            receptacle: Receptacle name (e.g., "dresser  1", "shelf5", "drawer   1")
+            
+        Returns:
+            Normalized receptacle name with exactly one space (e.g., "dresser 1", "shelf 5", "drawer 1")
+        """
+        # Match letters (receptacle class) + zero or more spaces + digits (num_id)
+        # Replace with receptacle_class + one space + num_id
+        normalized = re.sub(r'([a-zA-Z]+)\s*(\d+)', r'\1 \2', receptacle)
+        return normalized
+    
+    def is_openable_receptacle(self, receptacle: str) -> bool:
+        for openable_receptacle in OPENABLE_CLASS_SET:
+            if openable_receptacle.lower() in receptacle.lower():
+                return True
+        return False
+
+    def update_receptacles(self, text_obs: List[str], actions: List[str]):
+        for i, action in enumerate(actions):
+            if "go to" in action:
+                parts = action.split("go to ", 1)
+                if len(parts) < 2:
+                    continue
+                receptacle = parts[1]
+                receptacle = self.normalize_receptacle(receptacle)
+                if self.is_openable_receptacle(receptacle):
+                    continue
+                if receptacle in text_obs[i] and receptacle in self.receptacles[i]:
+                    self.visited_receptacles[i].add(receptacle)
+                    self.unvisited_receptacles[i].discard(receptacle)
+            elif "open" in action:
+                parts = action.split("open ", 1)
+                if len(parts) < 2:
+                    continue
+                receptacle = parts[1]
+                receptacle = self.normalize_receptacle(receptacle)
+                if self.is_openable_receptacle(receptacle) and "is open" in text_obs[i] and receptacle in self.receptacles[i]:
+                    self.visited_receptacles[i].add(receptacle)
+                    self.unvisited_receptacles[i].discard(receptacle)
+    
     def extract_task(self, text_obs: List[str]):
         for obs in text_obs:
             task_start = obs.find('Your task is to: ')
@@ -247,8 +311,17 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
                 self.tasks.append(obs[task_start + len('Your task is to: '):].strip())
             else:
                 raise ValueError("Task description not found in text observation.")
-    
 
+    def extract_receptacles(self, admissible_actions: List[List[str]])->List[List[str]]:
+        receptacles = []
+        for actions in admissible_actions:
+            current_receptacle = set()
+            for action in actions:
+                if "go to" in action:
+                    current_receptacle.add(action.split("go to ")[1])
+            receptacles.append(current_receptacle)
+        return receptacles
+        
     def build_text_obs(self, text_obs: List[str], admissible_actions: List[List[str]], init: bool = False) -> List[str]:
         """
         This function builds the text observation for the agent.
@@ -283,9 +356,9 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
             postprocess_text_obs.append(obs)
         return postprocess_text_obs
     
-    def build_text_obs_with_known_and_unknown(self, text_obs: List[str], admissible_actions: List[List[str]], known_information: List[str], unknown_information: List[str]) -> List[str]:
+    def build_text_obs_with_known_and_unknown(self, text_obs: List[str], admissible_actions: List[List[str]], known_information: List[str], unknown_information: List[str], init: bool = False) -> List[str]:
         postprocess_text_obs = []
-        if self.config.env.history_length > 0:
+        if not init or self.config.env.history_length > 0:
             memory_contexts, valid_lens = self.memory.fetch(
                     self.config.env.history_length,
                     obs_key="text_obs",
@@ -295,7 +368,7 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
             # exclude 'help' in admissible_actions[i]
             reformatted_admissible_actions = "\n ".join(f"'{s}'" for s in admissible_actions[i] if s != 'help')
 
-            if self.config.env.history_length <= 0:
+            if init or self.config.env.history_length <= 0:
                 obs = self.prompt_init.format(
                     current_observation=text_obs[i],
                     admissible_actions=reformatted_admissible_actions
@@ -315,7 +388,42 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
 
             postprocess_text_obs.append(obs)
         return postprocess_text_obs
+    
+    def build_text_obs_gold(self, text_obs: List[str], admissible_actions: List[List[str]], init: bool = False) -> List[str]:
+        postprocess_text_obs = []
+        if not init or self.config.env.history_length > 0:
+            memory_contexts, valid_lens = self.memory.fetch(
+                    self.config.env.history_length,
+                    obs_key="text_obs",
+                    action_key="action")
 
+        for i in range(len(text_obs)):
+            # exclude 'help' in admissible_actions[i]
+            reformatted_admissible_actions = "\n ".join(f"'{s}'" for s in admissible_actions[i] if s != 'help')
+
+            visited_receptacles = ", ".join(sorted(list(self.visited_receptacles[i])))
+            unvisited_receptacles = ", ".join(sorted(list(self.unvisited_receptacles[i])))
+
+            if init or self.config.env.history_length <= 0:
+                obs = self.prompt_init.format(
+                    current_observation=text_obs[i],
+                    admissible_actions=reformatted_admissible_actions
+                )
+            else:
+                obs = self.prompt_history.format(
+                    task_description=self.tasks[i],
+                    admissible_actions=reformatted_admissible_actions,
+                    step_count=len(self.memory[i]),
+                    history_length=valid_lens[i],
+                    action_history=memory_contexts[i],
+                    current_step=len(self.memory[i]) + 1,
+                    current_observation=text_obs[i],
+                    visited_receptacles=visited_receptacles,
+                    unvisited_receptacles=unvisited_receptacles
+                )
+
+            postprocess_text_obs.append(obs)
+        return postprocess_text_obs
     def _process_batch(self, batch_idx, total_batch_list, total_infos, success):
         # Find the last entry with active masks
         for i in reversed(range(len(total_batch_list[batch_idx]))):
@@ -947,7 +1055,7 @@ def make_envs(config):
             raise ValueError(f"Unsupported environment: {config.env.env_name}")
 
         env_kwargs = {
-            'eval_dataset': 'eval_in_distribution', # 'eval_in_distribution' or 'eval_out_of_distribution'
+            'eval_dataset': 'eval_out_of_distribution', # 'eval_in_distribution' or 'eval_out_of_distribution'
         }
         _envs = build_alfworld_envs(alf_config_path, config.env.seed, config.data.train_batch_size, group_n, is_train=True, env_kwargs=env_kwargs, resources_per_worker=resources_per_worker)
         _val_envs = build_alfworld_envs(alf_config_path, config.env.seed + 1000, config.data.val_batch_size, 1, is_train=False, env_kwargs=env_kwargs, resources_per_worker=resources_per_worker)

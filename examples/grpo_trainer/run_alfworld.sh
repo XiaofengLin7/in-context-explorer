@@ -9,8 +9,8 @@ num_cpus_per_env_worker=0.1 # The CPU resource allocated for each environment wo
 train_data_size=16
 val_data_size=128
 group_size=8
-success_coef=30.0
-prompt_type=summary
+success_coef=50.0
+prompt_type=gold
 experiment_name=grpo_qwen2.5_1.5b_success_coef_${success_coef}_prompt_type_${prompt_type}
 # We only use data preparation to indicate the modality and the data size.
 python3 -m examples.data_preprocess.prepare \
@@ -60,7 +60,7 @@ python3 -m verl.trainer.main_ppo \
     env.success_coef=$success_coef \
     env.max_steps=50 \
     env.rollout.n=$group_size \
-    env.history_length=4 \
+    env.history_length=1 \
     env.resources_per_worker.num_cpus=$num_cpus_per_env_worker \
     trainer.critic_warmup=0 \
     trainer.logger=['console','wandb'] \
