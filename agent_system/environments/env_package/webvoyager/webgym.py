@@ -21,6 +21,7 @@ from openai import OpenAI
 from .webvoyager.utils import get_web_element_rect, encode_image, extract_information, print_message,\
     get_webarena_accessibility_tree, get_pdf_retrieval_ans_from_assistant, clip_message_and_obs, clip_message_and_obs_text_only
 from .webvoyager.utils_webarena import webarena_login, WEBARENA_DOMAINS
+from .webvoyager.utils_eval import webarena_eval
 
 
 class WebVoyagerEnv(gym.Env):
@@ -420,6 +421,7 @@ class WebVoyagerEnv(gym.Env):
                 logging.info(action['answer_content'])
                 logging.info('finish!!')
                 done = True
+                reward = self._webarena_eval(action['answer_content'])
             else:
                 raise NotImplementedError
 
@@ -469,7 +471,8 @@ class WebVoyagerEnv(gym.Env):
             'iteration': self.timestep,
             'action_key': action_key,
             'reward': reward,
-            'done': done
+            'done': done,
+            'won': reward == 1.0
         }
         
         return observation, reward, done, info
@@ -500,7 +503,12 @@ class WebVoyagerEnv(gym.Env):
                 'starting_url': self.starting_url
         }
         return observation
-        
+    
+    def _webarena_eval(self, answer):
+        eval_config = self.task['eval']
+        eval_config["webarena_starting_url"] = self.starting_url
+        # task content, answer, eval_config, driver, verbose
+        return webarena_eval(self.task['ques'], answer, eval_config, self.driver, verbose=True)
     
     def _exec_action_click(self, action, web_ele):
         self.driver.execute_script("arguments[0].setAttribute('target', '_self')", web_ele)
