@@ -6,6 +6,8 @@ git submodule update --init --recursive
 conda activate verl-agent # activate your previous installed conda env following README-verl-agent.md
 pip install -r agent_system/environments/env_package/webvoyager/webvoyager/requirements.txt
 pip install selenium==4.15.2
+pip install anthropic
+pip install nltk
 ```
 Test your webvoyager
 ```
