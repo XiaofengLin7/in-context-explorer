@@ -358,10 +358,19 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
             # exclude 'help' in admissible_actions[i]
             reformatted_admissible_actions = "\n ".join(f"'{s}'" for s in admissible_actions[i] if s != 'help')
 
-            if init or self.config.env.history_length <= 0:
-                obs = ALFWORLD_TEMPLATE_NO_HIS_SUMMARY.format(
+            if init:
+                obs = ALFWORLD_TEMPLATE_INIT_SUMMARY.format(
                     current_observation=text_obs[i],
                     admissible_actions=reformatted_admissible_actions
+                )
+            elif self.config.env.history_length <= 0:
+                obs = ALFWORLD_TEMPLATE_NO_HIS_SUMMARY.format(
+                    task_description=self.tasks[i],
+                    current_observation=text_obs[i],
+                    current_step=len(self.memory[i]) + 1,
+                    admissible_actions=reformatted_admissible_actions,
+                    known_information=known_information[i],
+                    unknown_information=unknown_information[i]
                 )
             else:
                 obs = ALFWORLD_TEMPLATE_SUMMARY.format(
