@@ -218,7 +218,12 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
         self.receptacles = self.extract_receptacles(self.envs.get_admissible_commands)
         # Initialize unvisited_receptacles as a copy of all receptacles
         self.unvisited_receptacles = [receptacle_set.copy() for receptacle_set in self.receptacles]
-        full_text_obs = self.build_text_obs(text_obs, self.envs.get_admissible_commands, init=True)
+        if self.config.env.prompt_type == 'gold':
+            full_text_obs = self.build_text_obs_gold(text_obs, self.envs.get_admissible_commands, init=True)
+        elif self.config.env.prompt_type == 'summary':
+            full_text_obs = self.build_text_obs_with_known_and_unknown(text_obs, self.envs.get_admissible_commands, [], [],init=True)
+        else:
+            full_text_obs = self.build_text_obs(text_obs, self.envs.get_admissible_commands, init=True)
         return {'text': full_text_obs, 'image': image_obs, 'anchor': text_obs}, infos
     
     def step(self, text_actions: List[str]):
@@ -278,7 +283,10 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
     def update_receptacles(self, text_obs: List[str], actions: List[str]):
         for i, action in enumerate(actions):
             if "go to" in action:
-                receptacle = action.split("go to ")[1]
+                parts = action.split("go to ", 1)
+                if len(parts) < 2:
+                    continue
+                receptacle = parts[1]
                 receptacle = self.normalize_receptacle(receptacle)
                 if self.is_openable_receptacle(receptacle):
                     continue
@@ -286,7 +294,10 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
                     self.visited_receptacles[i].add(receptacle)
                     self.unvisited_receptacles[i].discard(receptacle)
             elif "open" in action:
-                receptacle = action.split("open ")[1]
+                parts = action.split("open ", 1)
+                if len(parts) < 2:
+                    continue
+                receptacle = parts[1]
                 receptacle = self.normalize_receptacle(receptacle)
                 if self.is_openable_receptacle(receptacle) and "is open" in text_obs[i] and receptacle in self.receptacles[i]:
                     self.visited_receptacles[i].add(receptacle)
@@ -395,7 +406,7 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
 
             if init or self.config.env.history_length <= 0:
                 obs = self.prompt_init.format(
-                    task_description=self.tasks[i],
+                    current_observation=text_obs[i],
                     admissible_actions=reformatted_admissible_actions
                 )
             else:
@@ -1044,7 +1055,7 @@ def make_envs(config):
             raise ValueError(f"Unsupported environment: {config.env.env_name}")
 
         env_kwargs = {
-            'eval_dataset': 'eval_in_distribution', # 'eval_in_distribution' or 'eval_out_of_distribution'
+            'eval_dataset': 'eval_out_of_distribution', # 'eval_in_distribution' or 'eval_out_of_distribution'
         }
         _envs = build_alfworld_envs(alf_config_path, config.env.seed, config.data.train_batch_size, group_n, is_train=True, env_kwargs=env_kwargs, resources_per_worker=resources_per_worker)
         _val_envs = build_alfworld_envs(alf_config_path, config.env.seed + 1000, config.data.val_batch_size, 1, is_train=False, env_kwargs=env_kwargs, resources_per_worker=resources_per_worker)
