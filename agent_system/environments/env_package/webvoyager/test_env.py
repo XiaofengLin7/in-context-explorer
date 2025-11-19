@@ -11,7 +11,7 @@ if test_gym_env:
             api_key="your-api-key-here",
             headless=True,
             text_only=False,
-            env_config=OmegaConf.load("agent_system/environments/env_package/webvoyager/configs/configs.yaml"),
+            env_config=OmegaConf.load("agent_system/environments/env_package/webvoyager/configs/webarena_configs.yaml"),
             save_accessibility_tree=True,
             batch_id=0,
             num_containers_per_machine=1,
@@ -26,7 +26,8 @@ if test_gym_env:
         for line in f:
             tasks.append(json.loads(line))
     
-    task = tasks[0]
+    task = tasks[2]
+    print(task['eval'])
 
     # Reset environment
     obs, info = env.reset(task)
@@ -34,11 +35,11 @@ if test_gym_env:
 
     # Example actions
     actions = [
+        {'action_key': 'answer', 'answer_content': 'Sprite'},
         {'action_key': 'scroll', 'element': -1, 'content': 'down'},
         {'action_key': 'wait'},
         {'action_key': 'click', 'element': 1},
         {'action_key': 'type', 'element': 15, 'content': 'test'},
-        {'action_key': 'answer', 'answer_content': 'Finish the task'}
     ]
 
     # Execute actions
