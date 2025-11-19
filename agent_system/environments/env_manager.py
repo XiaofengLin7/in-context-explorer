@@ -195,15 +195,6 @@ class SearchEnvironmentManager(EnvironmentManagerBase):
 class AlfWorldEnvironmentManager(EnvironmentManagerBase):
     def __init__(self, envs, projection_f, config):
         self.memory = SimpleMemory()
-        self.prompt_init, self.prompt_history, self.keep_known_and_unknown = select_prompt_variant(
-            config,
-            ALFWORLD_TEMPLATE_NO_HIS,
-            ALFWORLD_TEMPLATE,
-            ALFWORLD_TEMPLATE_NO_HIS_SUMMARY,
-            ALFWORLD_TEMPLATE_SUMMARY,
-            ALFWORLD_TEMPLATE_NO_HIS,
-            ALFWORLD_TEMPLATE_GOLD
-        )
         super().__init__(envs, projection_f, config)
     
     def reset(self, kwargs):
@@ -228,20 +219,19 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
     
     def step(self, text_actions: List[str]):
         # extract known and unkown here as text_actions will be mutated in place in  self.projection_f
-        if self.keep_known_and_unknown:
+        if self.config.env.prompt_type == 'summary':
             known_information, unknown_information = extract_known_and_unknown(text_actions)
         actions, valids = self.projection_f(text_actions, self.envs.get_admissible_commands)
         text_obs, image_obs, rewards, dones, infos = self.envs.step(actions)
         self.memory.store({'text_obs': self.pre_text_obs, 'action': actions})
         self.pre_text_obs = text_obs
         self.update_receptacles(text_obs, actions)
-        if self.keep_known_and_unknown:
+        if self.config.env.prompt_type == 'summary':
             full_text_obs = self.build_text_obs_with_known_and_unknown(text_obs, self.envs.get_admissible_commands, known_information, unknown_information)
+        elif self.config.env.prompt_type == 'gold':
+            full_text_obs = self.build_text_obs_gold(text_obs, self.envs.get_admissible_commands)
         else:
-            if self.config.env.prompt_type == 'gold':
-                full_text_obs = self.build_text_obs_gold(text_obs, self.envs.get_admissible_commands)
-            else:
-                full_text_obs = self.build_text_obs(text_obs, self.envs.get_admissible_commands)
+            full_text_obs = self.build_text_obs(text_obs, self.envs.get_admissible_commands)
 
         if infos[0].get("extra.gamefile") is None:
             infos = set_gamefile(infos, self.gamefile)
@@ -338,12 +328,12 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
             reformatted_admissible_actions = "\n ".join(f"'{s}'" for s in admissible_actions[i] if s != 'help')
 
             if init or self.config.env.history_length <= 0:
-                obs = self.prompt_init.format(
+                obs = ALFWORLD_TEMPLATE_NO_HIS.format(
                     current_observation=text_obs[i],
                     admissible_actions=reformatted_admissible_actions
                 )
             else:
-                obs = self.prompt_history.format(
+                obs = ALFWORLD_TEMPLATE.format(
                     task_description=self.tasks[i],
                     step_count=len(self.memory[i]),
                     history_length=valid_lens[i],
@@ -358,7 +348,7 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
     
     def build_text_obs_with_known_and_unknown(self, text_obs: List[str], admissible_actions: List[List[str]], known_information: List[str], unknown_information: List[str], init: bool = False) -> List[str]:
         postprocess_text_obs = []
-        if not init or self.config.env.history_length > 0:
+        if not init and self.config.env.history_length > 0:
             memory_contexts, valid_lens = self.memory.fetch(
                     self.config.env.history_length,
                     obs_key="text_obs",
@@ -368,13 +358,22 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
             # exclude 'help' in admissible_actions[i]
             reformatted_admissible_actions = "\n ".join(f"'{s}'" for s in admissible_actions[i] if s != 'help')
 
-            if init or self.config.env.history_length <= 0:
-                obs = self.prompt_init.format(
+            if init:
+                obs = ALFWORLD_TEMPLATE_INIT_SUMMARY.format(
                     current_observation=text_obs[i],
                     admissible_actions=reformatted_admissible_actions
                 )
+            elif self.config.env.history_length <= 0:
+                obs = ALFWORLD_TEMPLATE_NO_HIS_SUMMARY.format(
+                    task_description=self.tasks[i],
+                    current_observation=text_obs[i],
+                    current_step=len(self.memory[i]) + 1,
+                    admissible_actions=reformatted_admissible_actions,
+                    known_information=known_information[i],
+                    unknown_information=unknown_information[i]
+                )
             else:
-                obs = self.prompt_history.format(
+                obs = ALFWORLD_TEMPLATE_SUMMARY.format(
                     task_description=self.tasks[i],
                     step_count=len(self.memory[i]),
                     history_length=valid_lens[i],
@@ -391,7 +390,7 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
     
     def build_text_obs_gold(self, text_obs: List[str], admissible_actions: List[List[str]], init: bool = False) -> List[str]:
         postprocess_text_obs = []
-        if not init or self.config.env.history_length > 0:
+        if not init and self.config.env.history_length > 0:
             memory_contexts, valid_lens = self.memory.fetch(
                     self.config.env.history_length,
                     obs_key="text_obs",
@@ -405,12 +404,12 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
             unvisited_receptacles = ", ".join(sorted(list(self.unvisited_receptacles[i])))
 
             if init or self.config.env.history_length <= 0:
-                obs = self.prompt_init.format(
+                obs = ALFWORLD_TEMPLATE_NO_HIS.format(
                     current_observation=text_obs[i],
                     admissible_actions=reformatted_admissible_actions
                 )
             else:
-                obs = self.prompt_history.format(
+                obs = ALFWORLD_TEMPLATE_GOLD.format(
                     task_description=self.tasks[i],
                     admissible_actions=reformatted_admissible_actions,
                     step_count=len(self.memory[i]),
