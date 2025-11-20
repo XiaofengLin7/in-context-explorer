@@ -135,6 +135,9 @@ class WebVoyagerEnv(gym.Env):
         options.add_argument("--no-sandbox")
         options.add_argument("--disable-dev-shm-usage")
         options.add_argument("--disable-gpu")
+        # Set window size via Chrome options to avoid hanging issues with set_window_size()
+        # This is more reliable, especially in headless mode
+        options.add_argument(f"--window-size={self.window_width},{self.window_height}")
         options.add_experimental_option(
             "prefs", {
                 "download.default_directory": self.download_dir,
@@ -162,8 +165,10 @@ class WebVoyagerEnv(gym.Env):
             self.driver.quit()
             
         # Initialize new driver
+        # Window size is set via Chrome options (--window-size) to avoid hanging issues
+        # that can occur with driver.set_window_size() in headless mode
         self.driver = webdriver.Chrome(options=self.options)
-        self.driver.set_window_size(self.window_width, self.window_height)
+        
         # Explicit timeouts
         try:
             self.driver.set_page_load_timeout(30)

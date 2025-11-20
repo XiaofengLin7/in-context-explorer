@@ -14,7 +14,8 @@ class WebVoyagerWorker:
                     api_key="your-api-key-here",
                     env_config=env_config,
                     headless=True,
-                    text_only=False
+                    text_only=False,
+                    batch_id=0,
                 )
         self.data_file = data_file
         self.tasks = []
@@ -186,23 +187,60 @@ class WebVoyagerMultiProcessEnv(gym.Env):
         if getattr(self, '_closed', False):
             return
 
-        # Close all workers and kill Ray actors
-        close_futures = []
-        for worker in self._workers:
-            future = worker.close.remote()
-            close_futures.append(future)
+        # Check if Ray is initialized and workers exist before attempting cleanup
+        if not ray.is_initialized():
+            return
         
-        # Wait for all workers to close
-        ray.get(close_futures)
-        
-        # Kill all Ray actors
-        for worker in self._workers:
-            ray.kill(worker)
+        if not hasattr(self, '_workers') or not self._workers:
+            self._closed = True
+            return
+
+        try:
+            # Close all workers and kill Ray actors
+            close_futures = []
+            for worker in self._workers:
+                try:
+                    future = worker.close.remote()
+                    close_futures.append(future)
+                except Exception:
+                    # Ignore errors during shutdown
+                    pass
+            
+            # Wait for all workers to close (if any futures were created)
+            if close_futures:
+                try:
+                    ray.get(close_futures)
+                except Exception:
+                    # Ignore errors during shutdown
+                    pass
+            
+            # Kill all Ray actors
+            for worker in self._workers:
+                try:
+                    ray.kill(worker)
+                except Exception:
+                    # Ignore errors during shutdown
+                    pass
+        except Exception:
+            # Ignore all errors during shutdown - Ray might already be shutting down
+            pass
             
         self._closed = True
 
     def __del__(self):  # noqa: D401
-        self.close()
+        """Cleanup method called during object destruction.
+        
+        Safely handles cleanup even if Ray is already shutting down or
+        if the object is being destroyed during Python's shutdown process.
+        """
+        try:
+            # Only attempt cleanup if Ray is still initialized and workers exist
+            if ray.is_initialized() and hasattr(self, '_workers') and self._workers:
+                self.close()
+        except Exception:
+            # Silently ignore all errors during __del__ - this is called during
+            # Python shutdown when Ray and other modules may already be destroyed
+            pass
 
 
 # -----------------------------------------------------------------------------
