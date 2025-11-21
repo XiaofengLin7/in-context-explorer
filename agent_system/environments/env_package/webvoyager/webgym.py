@@ -181,6 +181,7 @@ class WebVoyagerEnv(gym.Env):
         
         # Store current task
         self.task = task
+        self.process_task_eval_info()
         self.timestep = 0
         
         # Clear pdf files in download directory
@@ -208,6 +209,7 @@ class WebVoyagerEnv(gym.Env):
         # Initialize URL mapping
         self.url_mapping = [(task['web'], task['web'])]
         url = task['web']
+        assert url is not None, f"url is None for task {task}"
         # breakpoint()
         # Handle WebArena login if needed (do this before creating messages)
         if self.webarena_host and task.get('web_name') and task['web_name'] in WEBARENA_DOMAINS:
@@ -227,19 +229,35 @@ class WebVoyagerEnv(gym.Env):
                 batch_id=self.batch_id, 
                 num_containers_per_machine=self.num_containers_per_machine
             )
+            assert url is not None, f"url is None for task {task}"
 
             if not success:
-                logging.error(f"[ERROR] WEBARENA LOGIN FAIL for {task['web_name']}")
+                logging.error(f"[ERROR] WEBARENA LOGIN FAIL for {task['web_name']} and url {url}")
                 self.fail_obs = f"WebArena login failed for {task['web_name']}"
+                self.starting_url = url
                 observation = self.get_observation()
                 info = {
                     'task_id': task['id'],
                     'task_question': task['ques'],
                     'task_url': task['web'],
+                    'done': True,
                     'iteration': self.timestep
                 }
                 return observation, info
-            self.url_mapping = url_mapping
+            else:
+                print(f"WebArena login successful for {task['web_name']} and url {url}")
+            if len(url_mapping) != 0:
+                self.url_mapping = url_mapping
+        else:
+            print(f"reset failed for {task['web_name']}")
+            self.fail_obs = f"not such task."
+            self.starting_url = url
+            observation = {}
+            info = {
+                'done': True,
+                'iteration': self.timestep
+            }
+            return observation, info
         
         self.starting_url = url
         print(f"url returned from login: {url}")
@@ -292,6 +310,7 @@ class WebVoyagerEnv(gym.Env):
             'task_id': task['id'],
             'task_question': task['ques'],
             'task_url': task['web'],
+            'done': False,
             'iteration': self.timestep
         }
         
@@ -443,8 +462,8 @@ class WebVoyagerEnv(gym.Env):
         
         # in the multi-turn loop in verl-agent, check if max iterations reached
         
-        if self.fail_obs:
-            done = True
+        # if self.fail_obs:
+        #     done = True
         
         # get env info
         try:
@@ -486,6 +505,8 @@ class WebVoyagerEnv(gym.Env):
         """Get current observation from the environment."""
         # Apply URL mapping if webarena is used
         url = self.driver.current_url
+        # breakpoint()
+        # TODO: figure out why the url is being changed and what happens in the actual observation.
         if self.url_mapping:
             for map_pattern in self.url_mapping:
                 url = url.replace(map_pattern[0], map_pattern[1]) if map_pattern[0] in url else url
@@ -532,14 +553,17 @@ class WebVoyagerEnv(gym.Env):
             self.warn_obs = f"note: The web element you're trying to type may not be a textbox, and its tag name is <{web_ele.tag_name}>, type is {ele_type}."
         try:
             # Not always work to delete
-            web_ele.clear()
-            # Another way to delete
-            if platform.system() == 'Darwin':
-                web_ele.send_keys(Keys.COMMAND + "a")
-            else:
-                web_ele.send_keys(Keys.CONTROL + "a")
-            web_ele.send_keys(" ")
-            web_ele.send_keys(Keys.BACKSPACE)
+            try:
+                web_ele.clear()
+            except Exception as e:
+                logging.warning(f"Could not clear input field, try another way to delete")
+                # Another way to delete
+                if platform.system() == 'Darwin':
+                    web_ele.send_keys(Keys.COMMAND + "a")
+                else:
+                    web_ele.send_keys(Keys.CONTROL + "a")
+                web_ele.send_keys(" ")
+                web_ele.send_keys(Keys.BACKSPACE)
         except Exception as e:
             logging.warning(f"Could not clear input field: {e}")
             pass
@@ -589,6 +613,54 @@ class WebVoyagerEnv(gym.Env):
             else:
                 actions.key_down(Keys.ALT).send_keys(Keys.ARROW_UP).key_up(Keys.ALT).perform()
         time.sleep(3)
+
+    def process_task_eval_info(self):
+        """
+        Process task evaluation information by replacing old EC addresses 
+        with the current webarena host in eval config URLs.
+        
+        This ensures that webarena_eval can successfully evaluate trajectories
+        by using the correct host addresses in reference_url and program_html URLs.
+        """
+        if self.task.get('eval') is not None and self.webarena_host:
+            eval_config = self.task['eval']
+            
+            # Get common host from env_config if available
+            if self.env_config and hasattr(self.env_config, 'common_webarena_host'):
+                common_host = self.env_config.common_webarena_host
+            else:
+                # Fallback: use webarena_host if common_webarena_host is not available
+                common_host = self.webarena_host
+            
+            # Replace old EC addresses in reference_url
+            if 'reference_url' in eval_config and eval_config['reference_url']:
+                ref_url = eval_config['reference_url']
+                if "ec2-98-81-119-107.compute-1.amazonaws.com" in ref_url:
+                    eval_config['reference_url'] = ref_url.replace(
+                        "ec2-98-81-119-107.compute-1.amazonaws.com", 
+                        common_host
+                    )
+                if "192.222.54.137" in eval_config['reference_url']:
+                    eval_config['reference_url'] = eval_config['reference_url'].replace(
+                        "192.222.54.137", 
+                        common_host
+                    )
+            
+            # Replace old EC addresses in program_html URLs
+            if 'program_html' in eval_config and isinstance(eval_config['program_html'], list):
+                for program_item in eval_config['program_html']:
+                    if 'url' in program_item and program_item['url']:
+                        url = program_item['url']
+                        if "ec2-98-81-119-107.compute-1.amazonaws.com" in url:
+                            program_item['url'] = url.replace(
+                                "ec2-98-81-119-107.compute-1.amazonaws.com", 
+                                common_host
+                            )
+                        if "192.222.54.137" in program_item['url']:
+                            program_item['url'] = program_item['url'].replace(
+                                "192.222.54.137", 
+                                common_host
+                            )
 
     def render(self, mode='human'):
         """Render the environment."""
