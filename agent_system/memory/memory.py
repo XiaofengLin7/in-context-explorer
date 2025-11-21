@@ -216,8 +216,10 @@ class WebVoyagerMemory(BaseMemory):
         Behavior:
         - All stored records per env are included (no truncation by history_length).
         - Older user messages are compressed to: "Observation omitted for previous steps. See attachment for screenshot."
-        - A global cap of `max_images` images is applied per env, removing the
-          oldest images first and cleaning the helper text accordingly.
+        - A global cap of `max_images` images is applied per env. The latest user message is always preserved
+          with its full detailed observation (including accessibility_tree and image). Older messages are clipped
+          to ensure the total image count (history + latest) does not exceed `max_images`, removing the oldest
+          images first and cleaning the helper text accordingly.
         - If the immediately preceding assistant message contains an ANSWER action,
           the most recent user message is appended with the double-check guidance.
 
@@ -264,22 +266,36 @@ class WebVoyagerMemory(BaseMemory):
 
                 messages.append({"role": "user", "content": user_msg_content})
 
-            # Apply clipping only to history before the latest user message.
-            # The most recent user message should never be clipped, matching the
-            # environment's behavior (clip before appending new).
-            last_user_idx = None
-            for i in range(len(messages) - 1, -1, -1):
-                if messages[i].get("role") == "user":
-                    last_user_idx = i
-                    break
-            should_clip = len(messages) >= 3
-            if should_clip:
+            # Apply clipping to ensure exactly max_images images total, while preserving
+            # the latest user message with its full detailed observation (including accessibility_tree and image).
+            # Clip only the history before the latest message, accounting for the latest message's image.
+            if len(messages) > 0:
+                # Find the latest user message
+                last_user_idx = None
+                for i in range(len(messages) - 1, -1, -1):
+                    if messages[i].get("role") == "user":
+                        last_user_idx = i
+                        break
+                
                 if last_user_idx is not None and last_user_idx > 0:
+                    # Count images in the latest user message
+                    latest_msg = messages[last_user_idx]
+                    latest_images = 0
+                    if latest_msg.get("role") == "user":
+                        content = latest_msg.get("content", [])
+                        for item in content:
+                            if item.get("type") and "image" in item.get("type"):
+                                latest_images += 1
+                    
+                    # Clip history messages to (max_images - latest_images) images
+                    # This ensures total images = latest_images + history_images <= max_images
                     history_msgs = messages[:last_user_idx]
                     latest_msgs = messages[last_user_idx:]
-                    clipped_history = self._clip_messages_like_env(history_msgs, max_images)
+                    max_history_images = max(0, max_images - latest_images)
+                    clipped_history = self._clip_messages_like_env(history_msgs, max_history_images)
                     messages = clipped_history + latest_msgs
                 else:
+                    # If no history or only one message, clip all messages normally
                     messages = self._clip_messages_like_env(messages, max_images)
 
             # ANSWER double-check guard: if previous assistant message (immediately
