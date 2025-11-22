@@ -229,7 +229,6 @@ class WebVoyagerEnv(gym.Env):
                 batch_id=self.batch_id, 
                 num_containers_per_machine=self.num_containers_per_machine
             )
-            assert url is not None, f"url is None for task {task}"
 
             if not success:
                 logging.error(f"[ERROR] WEBARENA LOGIN FAIL for {task['web_name']} and url {url}")
@@ -263,7 +262,17 @@ class WebVoyagerEnv(gym.Env):
         print(f"url returned from login: {url}")
         
         # Navigate to the task URL
-        self.driver.get(url)
+        try:
+            self.driver.get(url)
+        except Exception as e:
+            logging.error(f"Failed to navigate to the task URL: {e}")
+            self.fail_obs = f"Failed to navigate to the task URL: {e}"
+            observation = self.get_observation()
+            info = {
+                'done': True,
+                'iteration': self.timestep
+            }
+            return observation, info
         try:
             self.driver.find_element(By.TAG_NAME, 'body').click()
         except Exception as e:
