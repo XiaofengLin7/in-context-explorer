@@ -75,6 +75,7 @@ class WebVoyagerEnv(gym.Env):
         else:
             self.webarena_host = None
         
+        self.max_timesteps = self.env_config.get("max_timesteps", 10)
         self.headless = headless
         self.text_only = text_only
         self.window_width = window_width
@@ -313,6 +314,13 @@ class WebVoyagerEnv(gym.Env):
             accessibility_tree_path = os.path.join(self.worker_dir, 'accessibility_tree{}'.format(self.timestep))
             self.accessibility_tree, self.obs_info = get_webarena_accessibility_tree(self.driver, accessibility_tree_path)
         
+        self.url = self.driver.current_url
+            
+        for attr in ['url', 'accessibility_tree']:
+            for map_pattern in self.url_mapping:
+                setattr(self, attr, getattr(self, attr).replace(map_pattern[0], map_pattern[1]))
+
+        self.starting_url = self.url_mapping[-1][0]
         # Get initial observation
         observation = self.get_observation()
         info = {
@@ -349,7 +357,10 @@ class WebVoyagerEnv(gym.Env):
 
         reward = 0.0
         done = False
-        
+        info = {
+            'iteration': self.timestep,
+            'action_key': action_key,
+        }
         self.fail_obs = ""
         self.pdf_obs = ""
         self.warn_obs = ""
@@ -453,8 +464,12 @@ class WebVoyagerEnv(gym.Env):
             elif action_key == 'answer':
                 logging.info(action['answer_content'])
                 logging.info('finish!!')
-                done = True
-                reward = self._webarena_eval(action['answer_content'])
+                info['answer'] = action['answer_content'] if action['answer_content'] else "N/A"
+                info['reference_answer'] = None
+                if self.task.get('eval') and self.task['eval'] and self.task['eval'].get('reference_answer_raw_annotation'):
+                    info['reference_answer'] = self.task['eval']['reference_answer_raw_annotation']
+                if self.task.get('reference_answer'):
+                    info['reference_answer'] = self.task['reference_answer']
             else:
                 raise NotImplementedError
 
@@ -497,32 +512,30 @@ class WebVoyagerEnv(gym.Env):
             accessibility_tree_path = os.path.join(self.worker_dir, 'accessibility_tree{}'.format(self.timestep))
             self.accessibility_tree, self.obs_info = get_webarena_accessibility_tree(self.driver, accessibility_tree_path)
         
+
+        if self.timestep >= self.max_timesteps or action_key == 'answer':
+            done = True
+            answer = info.get('answer', 'N/A')
+            eval_config = self.task['eval']
+            eval_config["webarena_starting_url"] = self.starting_url
+            reward = webarena_eval(self.task['ques'], answer, eval_config, self.driver, verbose=True)
+
+        info['done'] = done 
+        info['won'] = reward == 1.0
+        self.url = self.driver.current_url
+            
+        for attr in ['url', 'accessibility_tree']:
+            for map_pattern in self.url_mapping:
+                setattr(self, attr, getattr(self, attr).replace(map_pattern[0], map_pattern[1]))
         # Get new observation
         observation = self.get_observation()
-        
-        info = {
-            'iteration': self.timestep,
-            'action_key': action_key,
-            'reward': reward,
-            'done': done,
-            'won': reward == 1.0
-        }
-        
+
         return observation, reward, done, info
     
     def get_observation(self) -> Dict[str, Any]:
         """Get current observation from the environment."""
         # Apply URL mapping if webarena is used
-        url = self.driver.current_url
         # breakpoint()
-        # TODO: figure out why the url is being changed and what happens in the actual observation.
-        if self.url_mapping:
-            for map_pattern in self.url_mapping:
-                url = url.replace(map_pattern[0], map_pattern[1]) if map_pattern[0] in url else url
-        
-        if self.url_mapping:
-            for map_pattern in self.url_mapping:
-                self.starting_url = self.starting_url.replace(map_pattern[0], map_pattern[1]) if map_pattern[0] in self.starting_url else self.starting_url
         
         # we can append those we need
         observation = {
@@ -532,7 +545,7 @@ class WebVoyagerEnv(gym.Env):
                 'warn_obs': self.warn_obs,
                 'fail_obs': self.fail_obs,
                 'task_ques': self.task['ques'] if self.task else "",
-                'url': url,
+                'url': self.url,
                 'web_name': self.task['web_name'] if self.task else "",
                 'task_dir': self.task_dir,
                 'starting_url': self.starting_url
