@@ -93,8 +93,9 @@ class WebVoyagerEnv(gym.Env):
         # Initialize OpenAI client
         self.client = OpenAI(api_key=api_key)
         
-        # Initialize browser options
-        self.options = self._driver_config()
+        # Prepare Chrome profile root inside user-writable space
+        self.chrome_profile_root = os.path.join(self.download_dir, "chrome_profiles")
+        os.makedirs(self.chrome_profile_root, exist_ok=True)
         
         # Environment state
         self.driver = None
@@ -118,9 +119,21 @@ class WebVoyagerEnv(gym.Env):
         # Ensure download directory exists
         os.makedirs(download_dir, exist_ok=True)
         
-    def _driver_config(self):
-        """Configure Chrome driver options."""
+    def _driver_config(self, profile_dir: Optional[str] = None) -> webdriver.ChromeOptions:
+        """
+        Configure Chrome driver options.
+
+        Args:
+            profile_dir: Optional Chrome user-data directory for isolating worker state.
+
+        Returns:
+            Configured ChromeOptions instance.
+        """
         options = webdriver.ChromeOptions()
+
+        chrome_binary = os.getenv("CHROME_BINARY")
+        if chrome_binary:
+            options.binary_location = chrome_binary
         
         if self.save_accessibility_tree:
             self.force_device_scale = True
@@ -128,17 +141,22 @@ class WebVoyagerEnv(gym.Env):
         if self.force_device_scale:
             options.add_argument("--force-device-scale-factor=1")
         if self.headless:
-            options.add_argument("--headless")
+            options.add_argument("--headless=new")
             options.add_argument(
                 "--user-agent=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36"
             )
         # Improve stability in headless/HPC environments
         options.add_argument("--no-sandbox")
+        options.add_argument("--disable-setuid-sandbox")
         options.add_argument("--disable-dev-shm-usage")
         options.add_argument("--disable-gpu")
+        options.add_argument("--single-process")
         # Set window size via Chrome options to avoid hanging issues with set_window_size()
         # This is more reliable, especially in headless mode
         options.add_argument(f"--window-size={self.window_width},{self.window_height}")
+        if profile_dir:
+            options.add_argument(f"--user-data-dir={profile_dir}")
+
         options.add_experimental_option(
             "prefs", {
                 "download.default_directory": self.download_dir,
@@ -146,6 +164,17 @@ class WebVoyagerEnv(gym.Env):
             }
         )
         return options
+
+    def _safe_quit_driver(self) -> None:
+        """Best-effort driver teardown to prevent resource leaks."""
+        if self.driver is None:
+            return
+        try:
+            self.driver.quit()
+        except Exception as exc:
+            logging.warning("Failed to quit Chrome driver cleanly: %s", exc)
+        finally:
+            self.driver = None
     
     def reset(self, task: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         """
@@ -162,13 +191,24 @@ class WebVoyagerEnv(gym.Env):
             info: Additional information
         """
         # Close existing driver if any
-        if self.driver is not None:
-            self.driver.quit()
+        self._safe_quit_driver()
             
+        # Create per-worker Chrome profile to avoid cache conflicts
+        wid = self.worker_id if self.worker_id is not None else f"pid{os.getpid()}_{int(time.time()*1000)%1000000}"
+        base_task_dir = os.path.join(self.download_dir, f'task{task["id"]}', f'batch_id{self.batch_id}')
+        os.makedirs(base_task_dir, exist_ok=True)
+        self.worker_dir = os.path.join(base_task_dir, f'worker_{wid}')
+        os.makedirs(self.worker_dir, exist_ok=True)
+
+        self.chrome_profile_dir = os.path.join(self.worker_dir, "chrome_profile")
+        if os.path.exists(self.chrome_profile_dir):
+            shutil.rmtree(self.chrome_profile_dir, ignore_errors=True)
+        os.makedirs(self.chrome_profile_dir, exist_ok=True)
+
+        options = self._driver_config(profile_dir=self.chrome_profile_dir)
+
         # Initialize new driver
-        # Window size is set via Chrome options (--window-size) to avoid hanging issues
-        # that can occur with driver.set_window_size() in headless mode
-        self.driver = webdriver.Chrome(options=self.options)
+        self.driver = webdriver.Chrome(options=options)
         
         # Explicit timeouts
         try:
@@ -191,13 +231,6 @@ class WebVoyagerEnv(gym.Env):
             if os.path.isfile(file_path):
                 os.remove(file_path)
         
-        base_task_dir = os.path.join(self.download_dir, 'task{}'.format(task["id"]), 'batch_id{}'.format(self.batch_id))
-        os.makedirs(base_task_dir, exist_ok=True)
-
-        # Create a unique per-worker subdirectory under the task directory
-        wid = self.worker_id if self.worker_id is not None else f"pid{os.getpid()}_{int(time.time()*1000)%1000000}"
-        self.worker_dir = os.path.join(base_task_dir, f'worker_{wid}')
-        os.makedirs(self.worker_dir, exist_ok=True)
 
         # Preserve base task directory for compatibility, but write files to worker_dir
         self.task_dir = base_task_dir
