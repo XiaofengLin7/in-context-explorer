@@ -206,6 +206,8 @@ class SearchEnvironmentManager(EnvironmentManagerBase):
 class AlfWorldEnvironmentManager(EnvironmentManagerBase):
     def __init__(self, envs, projection_f, config):
         self.memory = SimpleMemory()
+        multi_episode_cfg = getattr(config.env, "multi_episode_rollout", None)
+        self.multi_episode_enabled = bool(getattr(multi_episode_cfg, "enable", False)) if multi_episode_cfg else False
         super().__init__(envs, projection_f, config)
     
     def reset(self, kwargs):
@@ -213,6 +215,7 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
         self.gamefile = parse_gamefile(infos)
         # initialize the history buffer
         self.memory.reset(batch_size = len(text_obs))
+        self.episode_ids = [0 for _ in range(len(text_obs))]
         self.tasks = []
         self.visited_receptacles = [set() for _ in range(len(text_obs))]
         self.pre_text_obs = text_obs
@@ -248,6 +251,7 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
             raw_text = text_obs_map[idx]
             self.pre_text_obs[idx] = raw_text
             self.gamefile[idx] = info_map[idx].get("extra.gamefile", gamefiles[env_indices.index(idx)])
+            self.episode_ids[idx] += 1
 
         if self.config.env.prompt_type == 'gold':
             full_text_obs = self.build_text_obs_gold(self.pre_text_obs, self.envs.get_admissible_commands)
@@ -277,7 +281,7 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
             known_information, unknown_information = extract_known_and_unknown(text_actions)
         actions, valids = self.projection_f(text_actions, self.envs.get_admissible_commands)
         text_obs, image_obs, rewards, dones, infos = self.envs.step(actions)
-        self.memory.store({'text_obs': self.pre_text_obs, 'action': actions})
+        self.memory.store({'text_obs': self.pre_text_obs, 'action': actions, 'episode_id': list(self.episode_ids)})
         self.pre_text_obs = text_obs
         self.update_receptacles(text_obs, actions)
         if self.config.env.prompt_type == 'summary':
@@ -371,11 +375,13 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
         This function builds the text observation for the agent.
         """
         postprocess_text_obs = []
+        memory_contexts = valid_lens = None
         if not init and self.config.env.history_length > 0:
             memory_contexts, valid_lens = self.memory.fetch(
                     self.config.env.history_length,
                     obs_key="text_obs",
-                    action_key="action")
+                    action_key="action",
+                    episode_key="episode_id" if self.multi_episode_enabled else None)
 
         for i in range(len(text_obs)):
             # exclude 'help' in admissible_actions[i]
@@ -387,11 +393,14 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
                     admissible_actions=reformatted_admissible_actions
                 )
             else:
+                history_text = memory_contexts[i]
+                if self.multi_episode_enabled and history_text:
+                    history_text = self._annotate_episode_history(history_text)
                 obs = ALFWORLD_TEMPLATE.format(
                     task_description=self.tasks[i],
                     step_count=len(self.memory[i]),
                     history_length=valid_lens[i],
-                    action_history=memory_contexts[i],
+                    action_history=history_text,
                     current_step=len(self.memory[i]) + 1,
                     current_observation=text_obs[i],
                     admissible_actions=reformatted_admissible_actions
@@ -402,11 +411,13 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
     
     def build_text_obs_with_known_and_unknown(self, text_obs: List[str], admissible_actions: List[List[str]], known_information: List[str], unknown_information: List[str], init: bool = False) -> List[str]:
         postprocess_text_obs = []
+        memory_contexts = valid_lens = None
         if not init and self.config.env.history_length > 0:
             memory_contexts, valid_lens = self.memory.fetch(
                     self.config.env.history_length,
                     obs_key="text_obs",
-                    action_key="action")
+                    action_key="action",
+                    episode_key="episode_id" if self.multi_episode_enabled else None)
 
         for i in range(len(text_obs)):
             # exclude 'help' in admissible_actions[i]
@@ -427,11 +438,14 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
                     unknown_information=unknown_information[i]
                 )
             else:
+                history_text = memory_contexts[i]
+                if self.multi_episode_enabled and history_text:
+                    history_text = self._annotate_episode_history(history_text)
                 obs = ALFWORLD_TEMPLATE_SUMMARY.format(
                     task_description=self.tasks[i],
                     step_count=len(self.memory[i]),
                     history_length=valid_lens[i],
-                    action_history=memory_contexts[i],
+                    action_history=history_text,
                     known_information=known_information[i],
                     unknown_information=unknown_information[i],
                     current_step=len(self.memory[i]) + 1,
@@ -444,11 +458,13 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
     
     def build_text_obs_gold(self, text_obs: List[str], admissible_actions: List[List[str]], init: bool = False) -> List[str]:
         postprocess_text_obs = []
+        memory_contexts = valid_lens = None
         if not init and self.config.env.history_length > 0:
             memory_contexts, valid_lens = self.memory.fetch(
                     self.config.env.history_length,
                     obs_key="text_obs",
-                    action_key="action")
+                    action_key="action",
+                    episode_key="episode_id" if self.multi_episode_enabled else None)
 
         for i in range(len(text_obs)):
             # exclude 'help' in admissible_actions[i]
@@ -463,12 +479,15 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
                     admissible_actions=reformatted_admissible_actions
                 )
             else:
+                history_text = memory_contexts[i]
+                if self.multi_episode_enabled and history_text:
+                    history_text = self._annotate_episode_history(history_text)
                 obs = ALFWORLD_TEMPLATE_GOLD.format(
                     task_description=self.tasks[i],
                     admissible_actions=reformatted_admissible_actions,
                     step_count=len(self.memory[i]),
                     history_length=valid_lens[i],
-                    action_history=memory_contexts[i],
+                    action_history=history_text,
                     current_step=len(self.memory[i]) + 1,
                     current_observation=text_obs[i],
                     visited_receptacles=visited_receptacles,
@@ -477,6 +496,10 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
 
             postprocess_text_obs.append(obs)
         return postprocess_text_obs
+
+    def _annotate_episode_history(self, history: str) -> str:
+        note = "Episode markers (Episode N) indicate observations from previous soft resets in this trajectory."
+        return history + "\n" + note
     def _process_batch(self, batch_idx, total_batch_list, total_infos, success):
         # Find the last entry with active masks
         for i in reversed(range(len(total_batch_list[batch_idx]))):

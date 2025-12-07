@@ -158,3 +158,25 @@ def test_alfworld_summary_pipeline_injects_known_unknown():
     assert "<unknown>Where the apple is.</unknown>" in t
 
 
+def test_alfworld_prompt_marks_episode_history():
+    cfg = make_config(prompt_type="vanilla", history_length=5)
+    cfg.env.multi_episode_rollout = types.SimpleNamespace(enable=True, reward_per_completion=1.0)
+
+    def projection_f(text_actions: List[str], admissible):
+        return ["OpenFridge"], [True]
+
+    mgr = AlfWorldEnvironmentManager(_FakeAlfEnvs(), projection_f, cfg)
+    mgr.reset(kwargs={})
+
+    for episode in range(4):
+        mgr.memory.store({
+            'text_obs': [f"Obs {episode}"],
+            'action': [f"Act {episode}"],
+            'episode_id': [episode],
+        })
+
+    prompts = mgr.build_text_obs(["Current obs"], [["Look"]], init=False)
+    prompt_text = prompts[0]
+    assert "Episode 4" in prompt_text
+    assert "Episode markers" in prompt_text
+

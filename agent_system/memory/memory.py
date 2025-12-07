@@ -61,6 +61,7 @@ class SimpleMemory(BaseMemory):
         history_length: int,
         obs_key: str = "text_obs",
         action_key: str = "action",
+        episode_key: Optional[str] = None,
     ) -> Tuple[List[str], List[int]]:
         """
         Fetch and format recent interaction history for each environment instance.
@@ -87,12 +88,23 @@ class SimpleMemory(BaseMemory):
             start_idx = len(self._data[env_idx]) - valid_len
 
             lines = []
+            prev_episode: Optional[int] = None
             for j, rec in enumerate(recent):
                 step_num = start_idx + j + 1
                 act = rec[action_key]
                 obs = rec[obs_key]
+
+                episode_label = ""
+                if episode_key is not None:
+                    raw_episode = rec.get(episode_key, 0)
+                    episode_num = int(raw_episode) + 1
+                    episode_label = f"Episode {episode_num} | "
+                    if prev_episode is None or episode_num != prev_episode:
+                        lines.append(f"--- Episode {episode_num} restart ---")
+                        prev_episode = episode_num
+
                 lines.append(
-                    f"[Observation {step_num}: '{obs}', Action {step_num}: '{act}']"
+                    f"[{episode_label}Observation {step_num}: '{obs}', Action {step_num}: '{act}']"
                 )
 
             memory_contexts.append("\n".join(lines))
