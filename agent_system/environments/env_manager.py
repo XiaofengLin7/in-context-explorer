@@ -71,7 +71,15 @@ def extract_known_and_unknown(responses: List[str]) -> Tuple[List[str], List[str
 
     return known_information, unknown_information
 
-def select_prompt_variant(config, vanilla_init: str, vanilla_history: str, summary_init: str, summary_history: str, gold_init: str, gold_history: str) -> Tuple[str, str, bool]:
+def select_prompt_variant(
+    config,
+    vanilla_init: str,
+    vanilla_history: str,
+    summary_init: str,
+    summary_history: str,
+    gold_init: str | None = None,
+    gold_history: str | None = None,
+) -> Tuple[str, str, bool]:
     """
     Return (prompt_init, prompt_history, keep_known_and_unknown) based on config.env.prompt_type.
     """
@@ -81,6 +89,9 @@ def select_prompt_variant(config, vanilla_init: str, vanilla_history: str, summa
     if prompt_type == 'vanilla':
         return vanilla_init, vanilla_history, False
     if prompt_type == 'gold':
+        if gold_init is None or gold_history is None:
+            # Fall back to vanilla variant if gold templates are not provided.
+            return vanilla_init, vanilla_history, False
         return gold_init, gold_history, False
     raise ValueError(f"Invalid prompt type: {config.env.prompt_type}")
 
@@ -216,6 +227,49 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
         else:
             full_text_obs = self.build_text_obs(text_obs, self.envs.get_admissible_commands, init=True)
         return {'text': full_text_obs, 'image': image_obs, 'anchor': text_obs}, infos
+    
+    def soft_reset(self, env_indices: List[int], prev_infos: List[Dict[str, Any]]):
+        if not env_indices:
+            return {}, {}
+
+        env_indices = [int(idx) for idx in env_indices]
+        gamefiles = []
+        for idx in env_indices:
+            info = prev_infos[idx]
+            gamefile = info.get("extra.gamefile") or self.gamefile[idx]
+            if gamefile is None:
+                raise ValueError(f"Environment index {idx} has no associated gamefile for soft reset.")
+            gamefiles.append(gamefile)
+
+        text_obs_map, image_obs_map, info_map = self.envs.soft_reset(env_indices, gamefiles)
+
+        # Update cached raw observations for later memory fetches.
+        for idx in env_indices:
+            raw_text = text_obs_map[idx]
+            self.pre_text_obs[idx] = raw_text
+            self.gamefile[idx] = info_map[idx].get("extra.gamefile", gamefiles[env_indices.index(idx)])
+
+        if self.config.env.prompt_type == 'gold':
+            full_text_obs = self.build_text_obs_gold(self.pre_text_obs, self.envs.get_admissible_commands)
+        elif self.config.env.prompt_type == 'summary':
+            empty_known = [""] * len(self.pre_text_obs)
+            empty_unknown = [""] * len(self.pre_text_obs)
+            full_text_obs = self.build_text_obs_with_known_and_unknown(
+                self.pre_text_obs,
+                self.envs.get_admissible_commands,
+                empty_known,
+                empty_unknown,
+            )
+        else:
+            full_text_obs = self.build_text_obs(self.pre_text_obs, self.envs.get_admissible_commands)
+
+        obs_updates = {"text": {}, "image": {}, "anchor": {}}
+        for idx in env_indices:
+            obs_updates["text"][idx] = full_text_obs[idx]
+            obs_updates["anchor"][idx] = self.pre_text_obs[idx]
+            obs_updates["image"][idx] = image_obs_map.get(idx)
+
+        return obs_updates, info_map
     
     def step(self, text_actions: List[str]):
         # extract known and unkown here as text_actions will be mutated in place in  self.projection_f
@@ -930,7 +984,7 @@ class WebVoyagerEnvironmentManager(EnvironmentManagerBase):
         })
 
         # Emit chat-formatted messages for the LLM; rollout flattens and extracts images
-        messages_per_env = self.memory.build_message_history(history_length=3, max_images=3)
+        messages_per_env = self.memory.build_message_history(history_length=3, max_images=2)
         observations = {
             'text': messages_per_env,
             'image': None,
@@ -997,7 +1051,7 @@ class WebVoyagerEnvironmentManager(EnvironmentManagerBase):
         })
 
         # Emit chat-formatted messages for the LLM; rollout flattens and extracts images
-        messages_per_env = self.memory.build_message_history(history_length=3, max_images=3)
+        messages_per_env = self.memory.build_message_history(history_length=3, max_images=2)
         next_observations = {
             'text': messages_per_env,
             'image': None,
