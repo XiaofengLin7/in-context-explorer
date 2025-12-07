@@ -298,6 +298,9 @@ env:
     num_gpus: 0
   rollout:
     n: 1 # the group number of envs (for GRPO and GiGPO).
+  multi_episode_rollout:
+    enable: False  # keep existing single-episode behavior when disabled
+    reward_per_completion: 1.0  # scalar multiplier for each successful completion within max_steps
   search:
     log_requests: false
     search_url: "http://127.0.0.1:8000/retrieve" # also support multiple urls: ["http://127.0.0.1:8000/retrieve", "http://127.0.0.1:8001/retrieve"]
