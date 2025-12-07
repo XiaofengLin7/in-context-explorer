@@ -326,6 +326,12 @@ class TrajectoryCollector:
         """
 
         batch_size = len(gen_batch.batch)
+        multi_episode_cfg = getattr(self.config.env, "multi_episode_rollout", None)
+        multi_episode_enabled = bool(getattr(multi_episode_cfg, "enable", False)) if multi_episode_cfg else False
+        reward_per_completion = float(getattr(multi_episode_cfg, "reward_per_completion", 1.0)) if multi_episode_enabled else 0.0
+        max_total_steps = int(getattr(self.config.env, "max_steps", 0))
+        total_step_counts = np.zeros(batch_size, dtype=np.int32)
+        success_counts = np.zeros(batch_size, dtype=np.int32)
 
         # Initial observations from the environment
         obs, infos = envs.reset(kwargs=gen_batch.non_tensor_batch.pop('env_kwargs', None))
@@ -406,6 +412,44 @@ class TrajectoryCollector:
             # episode_rewards += torch_to_numpy(rewards) * torch_to_numpy(active_masks)
             episode_rewards[active_masks] += torch_to_numpy(rewards)[active_masks]
             episode_lengths[active_masks] += 1
+            total_step_counts[active_masks] += 1
+
+            reset_idx_set: set[int] = set()
+            soft_reset_indices: list[int] = []
+            if multi_episode_enabled:
+                for idx in range(batch_size):
+                    if dones[idx] and bool(infos[idx].get("won", False)):
+                        success_counts[idx] += 1
+
+                for idx in range(batch_size):
+                    if (
+                        dones[idx]
+                        and bool(infos[idx].get("won", False))
+                        and total_step_counts[idx] < max_total_steps
+                    ):
+                        soft_reset_indices.append(idx)
+
+                if soft_reset_indices:
+                    try:
+                        obs_updates, info_updates = envs.soft_reset(soft_reset_indices, infos)
+                    except NotImplementedError as exc:
+                        raise RuntimeError("Multi-episode rollout requires environment soft_reset support.") from exc
+                    reset_idx_set = set(soft_reset_indices)
+
+                    for field in ("text", "image", "anchor"):
+                        if field not in obs_updates or obs_updates[field] == {}:
+                            continue
+                        if next_obs.get(field) is None:
+                            continue
+                        for idx, value in obs_updates[field].items():
+                            next_obs[field][idx] = value
+
+                    for idx, updated_info in info_updates.items():
+                        infos[idx] = updated_info
+                        dones[idx] = False
+
+            if not multi_episode_enabled:
+                reset_idx_set = set()
 
             assert len(rewards) == batch_size, f"env should return rewards for all environments, got {len(rewards)} rewards for {batch_size} environments"
             batch.non_tensor_batch['rewards'] = torch_to_numpy(rewards, is_object=True)
@@ -421,7 +465,14 @@ class TrajectoryCollector:
                 total_infos[i].append(infos[i])
 
             # Update done states
-            is_done = np.logical_or(is_done, dones)
+            if multi_episode_enabled:
+                new_done = total_step_counts >= max_total_steps
+                for idx in range(batch_size):
+                    if dones[idx] and idx not in reset_idx_set:
+                        new_done[idx] = True
+                is_done = np.logical_or(is_done, new_done)
+            else:
+                is_done = np.logical_or(is_done, dones)
                 
             # Update observations for next step
             obs = next_obs
@@ -436,19 +487,24 @@ class TrajectoryCollector:
                     episode_rewards=episode_rewards, 
                     episode_lengths=episode_lengths,
                     )
-        
-        # Apply ALFWorld/WebShop-specific trajectory reward shaping if applicable:
-        # desired: episode_reward = -T + 30 * I_success
-        # where T is episode_lengths, I_success is 1.0 if success else 0.0
-        success_coef = float(getattr(self.config.env, "success_coef", 30.0))
-        if success_coef != 0.0:
-            if "alfworld" in self.config.env.env_name.lower() or "webshop" in self.config.env.env_name.lower():
-                success_rate = success.get("success_rate")
-                if success_rate is not None:
-                    # ensure numpy arrays
-                    success_indicator = np.array(success_rate, dtype=np.float32)
-                    T = np.array(episode_lengths, dtype=np.float32)
-                    episode_rewards = (-T + success_coef) * success_indicator
+
+        if multi_episode_enabled:
+            success['avg_successes_within_max_steps'] = success_counts.astype(np.float32)
+            episode_rewards = success_counts.astype(np.float32) * reward_per_completion
+            episode_lengths = total_step_counts.astype(np.float32)
+        else:
+            # Apply ALFWorld/WebShop-specific trajectory reward shaping if applicable:
+            # desired: episode_reward = -T + 30 * I_success
+            # where T is episode_lengths, I_success is 1.0 if success else 0.0
+            success_coef = float(getattr(self.config.env, "success_coef", 30.0))
+            if success_coef != 0.0:
+                if "alfworld" in self.config.env.env_name.lower() or "webshop" in self.config.env.env_name.lower():
+                    success_rate = success.get("success_rate")
+                    if success_rate is not None:
+                        # ensure numpy arrays
+                        success_indicator = np.array(success_rate, dtype=np.float32)
+                        T = np.array(episode_lengths, dtype=np.float32)
+                        episode_rewards = (-T + success_coef) * success_indicator
 
 
         return total_batch_list, episode_rewards, episode_lengths, success, traj_uid, tool_callings
