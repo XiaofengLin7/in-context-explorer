@@ -487,8 +487,9 @@ class TrajectoryCollector:
                     episode_rewards=episode_rewards, 
                     episode_lengths=episode_lengths,
                     )
-
+        
         if multi_episode_enabled:
+            success['success_rate'] = (success_counts > 0).astype(np.float32)
             success['avg_successes_within_max_steps'] = success_counts.astype(np.float32)
             episode_rewards = success_counts.astype(np.float32) * reward_per_completion
             episode_lengths = total_step_counts.astype(np.float32)

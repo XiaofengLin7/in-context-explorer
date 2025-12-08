@@ -123,6 +123,7 @@ def test_multi_episode_reward_and_success_counter():
 
     assert env.soft_reset_calls == 1
     assert success["avg_successes_within_max_steps"][0] == pytest.approx(1.0)
+    assert success["success_rate"][0] == pytest.approx(1.0)
     assert episode_rewards[0] == pytest.approx(2.0)
     assert episode_lengths[0] == pytest.approx(2.0)
 
