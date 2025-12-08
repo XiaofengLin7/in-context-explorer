@@ -71,7 +71,15 @@ def extract_known_and_unknown(responses: List[str]) -> Tuple[List[str], List[str
 
     return known_information, unknown_information
 
-def select_prompt_variant(config, vanilla_init: str, vanilla_history: str, summary_init: str, summary_history: str, gold_init: str, gold_history: str) -> Tuple[str, str, bool]:
+def select_prompt_variant(
+    config,
+    vanilla_init: str,
+    vanilla_history: str,
+    summary_init: str,
+    summary_history: str,
+    gold_init: str | None = None,
+    gold_history: str | None = None,
+) -> Tuple[str, str, bool]:
     """
     Return (prompt_init, prompt_history, keep_known_and_unknown) based on config.env.prompt_type.
     """
@@ -81,6 +89,9 @@ def select_prompt_variant(config, vanilla_init: str, vanilla_history: str, summa
     if prompt_type == 'vanilla':
         return vanilla_init, vanilla_history, False
     if prompt_type == 'gold':
+        if gold_init is None or gold_history is None:
+            # Fall back to vanilla variant if gold templates are not provided.
+            return vanilla_init, vanilla_history, False
         return gold_init, gold_history, False
     raise ValueError(f"Invalid prompt type: {config.env.prompt_type}")
 
@@ -195,6 +206,8 @@ class SearchEnvironmentManager(EnvironmentManagerBase):
 class AlfWorldEnvironmentManager(EnvironmentManagerBase):
     def __init__(self, envs, projection_f, config):
         self.memory = SimpleMemory()
+        multi_episode_cfg = getattr(config.env, "multi_episode_rollout", None)
+        self.multi_episode_enabled = bool(getattr(multi_episode_cfg, "enable", False)) if multi_episode_cfg else False
         super().__init__(envs, projection_f, config)
     
     def reset(self, kwargs):
@@ -202,6 +215,10 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
         self.gamefile = parse_gamefile(infos)
         # initialize the history buffer
         self.memory.reset(batch_size = len(text_obs))
+        self.episode_ids = [0 for _ in range(len(text_obs))]
+        self.episode_step_ids = [0 for _ in range(len(text_obs))]
+        self.episode_start_messages = [""] * len(text_obs)
+        self.episode_step_ids = [0 for _ in range(len(text_obs))]
         self.tasks = []
         self.visited_receptacles = [set() for _ in range(len(text_obs))]
         self.pre_text_obs = text_obs
@@ -217,13 +234,73 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
             full_text_obs = self.build_text_obs(text_obs, self.envs.get_admissible_commands, init=True)
         return {'text': full_text_obs, 'image': image_obs, 'anchor': text_obs}, infos
     
+    def soft_reset(self, env_indices: List[int], prev_infos: List[Dict[str, Any]]):
+        if not env_indices:
+            return {}, {}
+
+        env_indices = [int(idx) for idx in env_indices]
+        gamefiles = []
+        for idx in env_indices:
+            info = prev_infos[idx]
+            gamefile = info.get("extra.gamefile") or self.gamefile[idx]
+            if gamefile is None:
+                raise ValueError(f"Environment index {idx} has no associated gamefile for soft reset.")
+            gamefiles.append(gamefile)
+
+        text_obs_map, image_obs_map, info_map = self.envs.soft_reset(env_indices, gamefiles)
+
+        # Update cached raw observations for later memory fetches.
+        for idx in env_indices:
+            raw_text = text_obs_map[idx]
+            self.pre_text_obs[idx] = raw_text
+            self.gamefile[idx] = info_map[idx].get("extra.gamefile", gamefiles[env_indices.index(idx)])
+            last_episode_steps = self.episode_step_ids[idx]
+            prev_episode = self.episode_ids[idx] + 1
+            self.episode_ids[idx] += 1
+            self.episode_step_ids[idx] = 0
+            if self.multi_episode_enabled:
+                current_episode = self.episode_ids[idx] + 1
+                self.episode_start_messages[idx] = (
+                    f"Previous episode {prev_episode} succeeded in {last_episode_steps} step(s). "
+                    f"Starting episode {current_episode}."
+                )
+
+        if self.config.env.prompt_type == 'gold':
+            full_text_obs = self.build_text_obs_gold(self.pre_text_obs, self.envs.get_admissible_commands)
+        elif self.config.env.prompt_type == 'summary':
+            empty_known = [""] * len(self.pre_text_obs)
+            empty_unknown = [""] * len(self.pre_text_obs)
+            full_text_obs = self.build_text_obs_with_known_and_unknown(
+                self.pre_text_obs,
+                self.envs.get_admissible_commands,
+                empty_known,
+                empty_unknown,
+            )
+        else:
+            full_text_obs = self.build_text_obs(self.pre_text_obs, self.envs.get_admissible_commands)
+
+        obs_updates = {"text": {}, "image": {}, "anchor": {}}
+        for idx in env_indices:
+            obs_updates["text"][idx] = full_text_obs[idx]
+            obs_updates["anchor"][idx] = self.pre_text_obs[idx]
+            obs_updates["image"][idx] = image_obs_map.get(idx)
+
+        return obs_updates, info_map
+    
     def step(self, text_actions: List[str]):
         # extract known and unkown here as text_actions will be mutated in place in  self.projection_f
         if self.config.env.prompt_type == 'summary':
             known_information, unknown_information = extract_known_and_unknown(text_actions)
         actions, valids = self.projection_f(text_actions, self.envs.get_admissible_commands)
         text_obs, image_obs, rewards, dones, infos = self.envs.step(actions)
-        self.memory.store({'text_obs': self.pre_text_obs, 'action': actions})
+        for idx in range(len(actions)):
+            self.episode_step_ids[idx] += 1
+        self.memory.store({
+            'text_obs': self.pre_text_obs,
+            'action': actions,
+            'episode_id': list(self.episode_ids),
+            'episode_step': list(self.episode_step_ids),
+        })
         self.pre_text_obs = text_obs
         self.update_receptacles(text_obs, actions)
         if self.config.env.prompt_type == 'summary':
@@ -317,11 +394,14 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
         This function builds the text observation for the agent.
         """
         postprocess_text_obs = []
+        memory_contexts = valid_lens = None
         if not init and self.config.env.history_length > 0:
             memory_contexts, valid_lens = self.memory.fetch(
                     self.config.env.history_length,
                     obs_key="text_obs",
-                    action_key="action")
+                    action_key="action",
+                    episode_key="episode_id" if self.multi_episode_enabled else None,
+                    episode_step_key="episode_step" if self.multi_episode_enabled else None)
 
         for i in range(len(text_obs)):
             # exclude 'help' in admissible_actions[i]
@@ -333,26 +413,31 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
                     admissible_actions=reformatted_admissible_actions
                 )
             else:
+                history_text = memory_contexts[i] if memory_contexts is not None else ""
                 obs = ALFWORLD_TEMPLATE.format(
                     task_description=self.tasks[i],
                     step_count=len(self.memory[i]),
                     history_length=valid_lens[i],
-                    action_history=memory_contexts[i],
+                    action_history=history_text,
                     current_step=len(self.memory[i]) + 1,
                     current_observation=text_obs[i],
                     admissible_actions=reformatted_admissible_actions
                 )
 
+            obs = self._prepend_episode_message(i, obs)
             postprocess_text_obs.append(obs)
         return postprocess_text_obs
     
     def build_text_obs_with_known_and_unknown(self, text_obs: List[str], admissible_actions: List[List[str]], known_information: List[str], unknown_information: List[str], init: bool = False) -> List[str]:
         postprocess_text_obs = []
+        memory_contexts = valid_lens = None
         if not init and self.config.env.history_length > 0:
             memory_contexts, valid_lens = self.memory.fetch(
                     self.config.env.history_length,
                     obs_key="text_obs",
-                    action_key="action")
+                    action_key="action",
+                    episode_key="episode_id" if self.multi_episode_enabled else None,
+                    episode_step_key="episode_step" if self.multi_episode_enabled else None)
 
         for i in range(len(text_obs)):
             # exclude 'help' in admissible_actions[i]
@@ -373,11 +458,12 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
                     unknown_information=unknown_information[i]
                 )
             else:
+                history_text = memory_contexts[i] if memory_contexts is not None else ""
                 obs = ALFWORLD_TEMPLATE_SUMMARY.format(
                     task_description=self.tasks[i],
                     step_count=len(self.memory[i]),
                     history_length=valid_lens[i],
-                    action_history=memory_contexts[i],
+                    action_history=history_text,
                     known_information=known_information[i],
                     unknown_information=unknown_information[i],
                     current_step=len(self.memory[i]) + 1,
@@ -385,16 +471,20 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
                     admissible_actions=reformatted_admissible_actions
                 )
 
+            obs = self._prepend_episode_message(i, obs)
             postprocess_text_obs.append(obs)
         return postprocess_text_obs
     
     def build_text_obs_gold(self, text_obs: List[str], admissible_actions: List[List[str]], init: bool = False) -> List[str]:
         postprocess_text_obs = []
+        memory_contexts = valid_lens = None
         if not init and self.config.env.history_length > 0:
             memory_contexts, valid_lens = self.memory.fetch(
                     self.config.env.history_length,
                     obs_key="text_obs",
-                    action_key="action")
+                    action_key="action",
+                    episode_key="episode_id" if self.multi_episode_enabled else None,
+                    episode_step_key="episode_step" if self.multi_episode_enabled else None)
 
         for i in range(len(text_obs)):
             # exclude 'help' in admissible_actions[i]
@@ -409,20 +499,32 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
                     admissible_actions=reformatted_admissible_actions
                 )
             else:
+                history_text = memory_contexts[i] if memory_contexts is not None else ""
                 obs = ALFWORLD_TEMPLATE_GOLD.format(
                     task_description=self.tasks[i],
                     admissible_actions=reformatted_admissible_actions,
                     step_count=len(self.memory[i]),
                     history_length=valid_lens[i],
-                    action_history=memory_contexts[i],
+                    action_history=history_text,
                     current_step=len(self.memory[i]) + 1,
                     current_observation=text_obs[i],
                     visited_receptacles=visited_receptacles,
                     unvisited_receptacles=unvisited_receptacles
                 )
 
+            obs = self._prepend_episode_message(i, obs)
             postprocess_text_obs.append(obs)
         return postprocess_text_obs
+
+    def _prepend_episode_message(self, idx: int, prompt: str) -> str:
+        if not self.multi_episode_enabled:
+            return prompt
+        message = self.episode_start_messages[idx]
+        if message:
+            prompt = f"{message}\n\n{prompt}"
+            self.episode_start_messages[idx] = ""
+        return prompt
+
     def _process_batch(self, batch_idx, total_batch_list, total_infos, success):
         # Find the last entry with active masks
         for i in reversed(range(len(total_batch_list[batch_idx]))):
@@ -431,8 +533,7 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
                 info = total_infos[batch_idx][i]
                 won_value = float(info['won'])
                 success['success_rate'].append(won_value)
-                
-                # Process game file if it exists
+
                 gamefile = info.get("extra.gamefile")
                 if gamefile:
                     self._process_gamefile(gamefile, won_value, success)
@@ -449,8 +550,9 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
         ]
         
         for task in tasks:
+            key = f"{task}_success_rate"
             if task in gamefile:
-                success[f"{task}_success_rate"].append(won_value)
+                success.setdefault(key, []).append(won_value)
                 break
 
 
@@ -696,11 +798,14 @@ class WebshopEnvironmentManager(EnvironmentManagerBase):
         This function builds the text observation for the agent.
         """
         postprocess_text_obs = []
+        memory_contexts = valid_lens = None
         if not init and self.config.env.history_length > 0:
             memory_contexts, valid_lens = self.memory.fetch(
                     self.config.env.history_length,
                     obs_key="text_obs",
-                    action_key="action")
+                    action_key="action",
+                    episode_key="episode_id" if self.multi_episode_enabled else None,
+                    episode_step_key="episode_step" if self.multi_episode_enabled else None)
             
         for i in range(len(text_obs)):
             
@@ -930,7 +1035,7 @@ class WebVoyagerEnvironmentManager(EnvironmentManagerBase):
         })
 
         # Emit chat-formatted messages for the LLM; rollout flattens and extracts images
-        messages_per_env = self.memory.build_message_history(history_length=3, max_images=3)
+        messages_per_env = self.memory.build_message_history(history_length=3, max_images=2)
         observations = {
             'text': messages_per_env,
             'image': None,
@@ -997,7 +1102,7 @@ class WebVoyagerEnvironmentManager(EnvironmentManagerBase):
         })
 
         # Emit chat-formatted messages for the LLM; rollout flattens and extracts images
-        messages_per_env = self.memory.build_message_history(history_length=3, max_images=3)
+        messages_per_env = self.memory.build_message_history(history_length=3, max_images=2)
         next_observations = {
             'text': messages_per_env,
             'image': None,

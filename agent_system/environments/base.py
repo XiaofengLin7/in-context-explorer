@@ -111,6 +111,14 @@ class EnvironmentManagerBase:
         """
         self.envs.close()
 
+    def soft_reset(self, env_indices, prev_infos):
+        """
+        Reset a subset of environments without clearing agent memory.
+        Concrete environment managers should override this when they support
+        intra-trajectory resets (e.g., for multi-episode rollouts).
+        """
+        raise NotImplementedError("soft_reset is not implemented for this environment.")
+
     def success_evaluator(self, *args, **kwargs) -> Dict[str, np.ndarray]:
         """
         Evaluate if the episodes are successful or not. 

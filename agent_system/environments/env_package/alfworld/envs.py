@@ -57,7 +57,6 @@ class AlfworldWorker:
     Ray remote actor that replaces the worker function.
     Each actor holds one environment instance.
     """
-    
     def __init__(self, config, seed, base_env):
         self.env = base_env.init_env(batch_size=1)  # Each worker holds only one sub-environment
         self.env.seed(seed)
@@ -75,6 +74,27 @@ class AlfworldWorker:
         obs, infos = self.env.reset()
         infos['observation_text'] = obs
         return obs, infos
+    
+    def reset_to_gamefile(self, gamefile):
+        """
+        Force-reset the underlying TextWorld env to a specific gamefile.
+        Keeps the iterator order intact so the next hard reset still advances.
+        """
+        batch_env = getattr(self.env, "batch_env", None)
+        if batch_env is None:
+            raise RuntimeError("Batch env is not initialized; cannot soft reset.")
+        batch_env.close()
+        batch_env.load([gamefile])
+        self.env.last_commands = [None]
+        obs, infos = batch_env.reset()
+        self.env.obs = obs
+        text_obs = obs[0]
+        info = {k: v[0] for k, v in infos.items()}
+        # Ensure downstream components can recover the originating task.
+        info.setdefault("extra.gamefile", gamefile)
+        info.setdefault("observation_text", text_obs)
+
+        return text_obs, None, info
     
     def getobs(self):
         """Get current observation image"""
@@ -106,6 +126,29 @@ class AlfworldEnvs(gym.Env):
             self.workers.append(worker)
 
         self.prev_admissible_commands = [None for _ in range(self.num_processes)]
+    
+    def soft_reset(self, indices, gamefiles):
+        """
+        Reset a subset of workers to specific gamefiles while keeping others untouched.
+        Returns per-index mappings for text/image observations and infos.
+        """
+        assert len(indices) == len(gamefiles), "Indices and gamefiles length mismatch."
+
+        futures = []
+        for idx, gamefile in zip(indices, gamefiles):
+            futures.append((idx, self.workers[idx].reset_to_gamefile.remote(gamefile)))
+
+        text_obs_map = {}
+        info_map = {}
+        results = ray.get([f for _, f in futures])
+        for (idx, _), (text_obs, _, info) in zip(futures, results):
+            text_obs_map[idx] = text_obs
+            info_map[idx] = info
+            admissible = info.get("admissible_commands")
+            if admissible is not None:
+                self.prev_admissible_commands[idx] = admissible
+
+        return text_obs_map, {}, info_map
 
     def step(self, actions):
         assert len(actions) == self.num_processes, \
