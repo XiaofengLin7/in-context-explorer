@@ -99,7 +99,7 @@ class SimpleMemory(BaseMemory):
                     raw_episode = rec.get(episode_key, 0)
                     episode_num = int(raw_episode) + 1
                     if prev_episode is None or episode_num != prev_episode:
-                        lines.append(f"--- Episode {episode_num} restart ---")
+                        lines.append(f"--- Episode {episode_num} start ---")
                         prev_episode = episode_num
                     local_step = rec.get(episode_step_key, step_num)
                     lines.append(

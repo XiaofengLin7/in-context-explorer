@@ -481,6 +481,11 @@ class TrajectoryCollector:
             if is_done.all():
                 break
         
+        if multi_episode_enabled:
+            for idx in range(batch_size):
+                if total_infos[idx]:
+                    total_infos[idx][-1]['won'] = float(success_counts[idx] > 0)
+
         success: Dict[str, np.ndarray] = envs.success_evaluator(
                     total_infos=total_infos,
                     total_batch_list=total_batch_list,
@@ -489,7 +494,6 @@ class TrajectoryCollector:
                     )
         
         if multi_episode_enabled:
-            success['success_rate'] = (success_counts > 0).astype(np.float32)
             success['avg_successes_within_max_steps'] = success_counts.astype(np.float32)
             episode_rewards = success_counts.astype(np.float32) * reward_per_completion
             episode_lengths = total_step_counts.astype(np.float32)

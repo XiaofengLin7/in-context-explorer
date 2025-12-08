@@ -533,8 +533,7 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
                 info = total_infos[batch_idx][i]
                 won_value = float(info['won'])
                 success['success_rate'].append(won_value)
-                
-                # Process game file if it exists
+
                 gamefile = info.get("extra.gamefile")
                 if gamefile:
                     self._process_gamefile(gamefile, won_value, success)
@@ -551,8 +550,9 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
         ]
         
         for task in tasks:
+            key = f"{task}_success_rate"
             if task in gamefile:
-                success[f"{task}_success_rate"].append(won_value)
+                success.setdefault(key, []).append(won_value)
                 break
 
 

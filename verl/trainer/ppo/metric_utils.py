@@ -198,7 +198,6 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> Dict[str,
         metrics[f"episode/{avg_success_key}"] = (
             batch.non_tensor_batch[avg_success_key][0].item()
         )
-    }
     return metrics
 
 
