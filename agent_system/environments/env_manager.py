@@ -219,6 +219,7 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
         self.episode_ids = [0 for _ in range(len(text_obs))]
         self.episode_step_ids = [0 for _ in range(len(text_obs))]
         self.episode_start_messages = [""] * len(text_obs)
+        self.episode_labels = [""] * len(text_obs)
         self.episode_step_ids = [0 for _ in range(len(text_obs))]
         self.tasks = []
         self.visited_receptacles = [set() for _ in range(len(text_obs))]
@@ -267,6 +268,7 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
                         f"Previous episode {prev_episode} succeeded in {last_episode_steps} step(s). "
                         f"Starting episode {current_episode}."
                     )
+                    label = f"previous episode {prev_episode} succeeded in {last_episode_steps} step(s)"
                 else:
                     episode_cap = int(self.episode_max_steps or self.config.env.max_steps)
                     message = (
@@ -274,7 +276,14 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
                         f"without success (per-episode cap: {episode_cap}). "
                         f"Starting episode {current_episode}."
                     )
+                    label = (
+                        f"previous episode {prev_episode} reached {last_episode_steps}/{episode_cap} step(s) "
+                        f"without success"
+                    )
                 self.episode_start_messages[idx] = message
+                self.episode_labels[idx] = label
+            else:
+                self.episode_labels[idx] = ""
 
         if self.config.env.prompt_type == 'gold':
             full_text_obs = self.build_text_obs_gold(self.pre_text_obs, self.envs.get_admissible_commands)
@@ -311,6 +320,7 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
             'action': actions,
             'episode_id': list(self.episode_ids),
             'episode_step': list(self.episode_step_ids),
+            'episode_label': list(self.episode_labels),
         })
         self.pre_text_obs = text_obs
         self.update_receptacles(text_obs, actions)
@@ -412,7 +422,8 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
                     obs_key="text_obs",
                     action_key="action",
                     episode_key="episode_id" if self.multi_episode_enabled else None,
-                    episode_step_key="episode_step" if self.multi_episode_enabled else None)
+                    episode_step_key="episode_step" if self.multi_episode_enabled else None,
+                    episode_label_key="episode_label" if self.multi_episode_enabled else None)
 
         for i in range(len(text_obs)):
             # exclude 'help' in admissible_actions[i]
@@ -448,7 +459,8 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
                     obs_key="text_obs",
                     action_key="action",
                     episode_key="episode_id" if self.multi_episode_enabled else None,
-                    episode_step_key="episode_step" if self.multi_episode_enabled else None)
+                    episode_step_key="episode_step" if self.multi_episode_enabled else None,
+                    episode_label_key="episode_label" if self.multi_episode_enabled else None)
 
         for i in range(len(text_obs)):
             # exclude 'help' in admissible_actions[i]
@@ -495,7 +507,8 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
                     obs_key="text_obs",
                     action_key="action",
                     episode_key="episode_id" if self.multi_episode_enabled else None,
-                    episode_step_key="episode_step" if self.multi_episode_enabled else None)
+                    episode_step_key="episode_step" if self.multi_episode_enabled else None,
+                    episode_label_key="episode_label" if self.multi_episode_enabled else None)
 
         for i in range(len(text_obs)):
             # exclude 'help' in admissible_actions[i]

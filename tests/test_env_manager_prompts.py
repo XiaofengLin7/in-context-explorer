@@ -226,3 +226,39 @@ def test_alfworld_soft_reset_timeout_message():
     assert "without success" in message
     assert "per-episode cap" in message
 
+
+def test_alfworld_episode_marker_includes_prev_outcome():
+    cfg = make_config(prompt_type="vanilla", history_length=5)
+    cfg.env.multi_episode_rollout = types.SimpleNamespace(
+        enable=True,
+        reward_per_completion=1.0,
+        episode_max_steps=10,
+    )
+
+    def projection_f(text_actions: List[str], admissible):
+        return ["OpenFridge"], [True]
+
+    mgr = AlfWorldEnvironmentManager(_FakeAlfEnvs(), projection_f, cfg)
+    mgr.reset(kwargs={})
+
+    # Episode 1 record
+    mgr.memory.store({
+        'text_obs': ["Obs ep1"],
+        'action': ["Act ep1"],
+        'episode_id': [0],
+        'episode_step': [1],
+        'episode_label': [""],
+    })
+    # Episode 2 record with label referencing episode 1 outcome
+    mgr.memory.store({
+        'text_obs': ["Obs ep2"],
+        'action': ["Act ep2"],
+        'episode_id': [1],
+        'episode_step': [1],
+        'episode_label': ["previous episode 1 reached 10/10 step(s) without success"],
+    })
+
+    prompts = mgr.build_text_obs(["Current obs"], [["Look"]], init=False)
+    text = prompts[0]
+    assert "Episode 2 start (previous episode 1 reached 10/10 step(s) without success)" in text
+

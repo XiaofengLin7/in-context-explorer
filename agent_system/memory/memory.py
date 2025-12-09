@@ -63,6 +63,7 @@ class SimpleMemory(BaseMemory):
         action_key: str = "action",
         episode_key: Optional[str] = None,
         episode_step_key: Optional[str] = None,
+        episode_label_key: Optional[str] = None,
     ) -> Tuple[List[str], List[int]]:
         """
         Fetch and format recent interaction history for each environment instance.
@@ -98,8 +99,12 @@ class SimpleMemory(BaseMemory):
                 if episode_key is not None:
                     raw_episode = rec.get(episode_key, 0)
                     episode_num = int(raw_episode) + 1
+                    label = (rec.get(episode_label_key, "") or "").strip() if episode_label_key else ""
                     if prev_episode is None or episode_num != prev_episode:
-                        lines.append(f"--- Episode {episode_num} start ---")
+                        if label:
+                            lines.append(f"--- Episode {episode_num} start ({label}) ---")
+                        else:
+                            lines.append(f"--- Episode {episode_num} start ---")
                         prev_episode = episode_num
                     local_step = rec.get(episode_step_key, step_num)
                     lines.append(
