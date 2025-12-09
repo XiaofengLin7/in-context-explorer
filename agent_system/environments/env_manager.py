@@ -208,6 +208,7 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
         self.memory = SimpleMemory()
         multi_episode_cfg = getattr(config.env, "multi_episode_rollout", None)
         self.multi_episode_enabled = bool(getattr(multi_episode_cfg, "enable", False)) if multi_episode_cfg else False
+        self.episode_max_steps = getattr(multi_episode_cfg, "episode_max_steps", None) if multi_episode_cfg else None
         super().__init__(envs, projection_f, config)
     
     def reset(self, kwargs):
@@ -255,15 +256,25 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
             self.pre_text_obs[idx] = raw_text
             self.gamefile[idx] = info_map[idx].get("extra.gamefile", gamefiles[env_indices.index(idx)])
             last_episode_steps = self.episode_step_ids[idx]
+            reason = prev_infos[idx].get("multi_episode_soft_reset_reason", "success")
             prev_episode = self.episode_ids[idx] + 1
             self.episode_ids[idx] += 1
             self.episode_step_ids[idx] = 0
             if self.multi_episode_enabled:
                 current_episode = self.episode_ids[idx] + 1
-                self.episode_start_messages[idx] = (
-                    f"Previous episode {prev_episode} succeeded in {last_episode_steps} step(s). "
-                    f"Starting episode {current_episode}."
-                )
+                if reason == "success":
+                    message = (
+                        f"Previous episode {prev_episode} succeeded in {last_episode_steps} step(s). "
+                        f"Starting episode {current_episode}."
+                    )
+                else:
+                    episode_cap = int(self.episode_max_steps or self.config.env.max_steps)
+                    message = (
+                        f"Previous episode {prev_episode} reached {last_episode_steps} step(s) "
+                        f"without success (per-episode cap: {episode_cap}). "
+                        f"Starting episode {current_episode}."
+                    )
+                self.episode_start_messages[idx] = message
 
         if self.config.env.prompt_type == 'gold':
             full_text_obs = self.build_text_obs_gold(self.pre_text_obs, self.envs.get_admissible_commands)

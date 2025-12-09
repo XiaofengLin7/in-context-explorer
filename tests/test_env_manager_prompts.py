@@ -21,6 +21,7 @@ def make_config(prompt_type: str = "summary", history_length: int = 1) -> Any:
     env = _EnvNS()
     env.prompt_type = prompt_type
     env.history_length = history_length
+    env.max_steps = 50
     # Minimal required fields for env-specific code paths
     env.env_name = "test"
     cfg.env = env
@@ -126,8 +127,14 @@ class _FakeAlfEnvs:
 
     def reset(self):
         image_obs = None
-        infos = [{"extra.gamefile": None}]
+        infos = [{"extra.gamefile": "fake_game"}]
         return self._text0, image_obs, infos
+
+    def soft_reset(self, env_indices: List[int], gamefiles: List[str]):
+        text_obs_map = {idx: self._text0[0] for idx in env_indices}
+        image_obs_map: Dict[int, None] = {}
+        info_map = {idx: {"extra.gamefile": gamefiles[i]} for i, idx in enumerate(env_indices)}
+        return text_obs_map, image_obs_map, info_map
 
     def step(self, actions: List[str]):
         text_obs = self._text1
@@ -197,4 +204,25 @@ def test_alfworld_prompt_includes_episode_intro_message():
 
     assert prompts[0].startswith("Previous episode 1 succeeded. Starting episode 2.")
     assert mgr.episode_start_messages[0] == ""
+
+
+def test_alfworld_soft_reset_timeout_message():
+    cfg = make_config(prompt_type="vanilla", history_length=1)
+    cfg.env.multi_episode_rollout = types.SimpleNamespace(
+        enable=True,
+        reward_per_completion=1.0,
+        episode_max_steps=3,
+    )
+
+    def projection_f(text_actions: List[str], admissible):
+        return ["OpenFridge"], [True]
+
+    mgr = AlfWorldEnvironmentManager(_FakeAlfEnvs(), projection_f, cfg)
+    _, infos = mgr.reset(kwargs={})
+    mgr.episode_step_ids[0] = 3
+    infos[0]["multi_episode_soft_reset_reason"] = "step_limit"
+    obs_updates, _ = mgr.soft_reset([0], infos)
+    message = obs_updates["text"][0]
+    assert "without success" in message
+    assert "per-episode cap" in message
 

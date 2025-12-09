@@ -278,7 +278,15 @@ class TrajectoryCollector:
 
         success_rate = {}
         for key, value in success.items():
-            success_rate[key] = np.mean(value)
+            metric_values = np.asarray(value, dtype=np.float32)
+            if metric_values.size == 0:
+                continue
+            if key.startswith("episode_"):
+                if np.isnan(metric_values).all():
+                    continue
+                success_rate[key] = np.nanmean(metric_values)
+            else:
+                success_rate[key] = np.mean(metric_values)
         
         effective_batch = []
         for bs in range(batch_size):
@@ -332,6 +340,28 @@ class TrajectoryCollector:
         max_total_steps = int(getattr(self.config.env, "max_steps", 0))
         total_step_counts = np.zeros(batch_size, dtype=np.int32)
         success_counts = np.zeros(batch_size, dtype=np.int32)
+        episode_step_counts: np.ndarray | None = None
+        current_episode_ids: np.ndarray | None = None
+        per_episode_success_flags: np.ndarray | None = None
+        per_episode_lengths: np.ndarray | None = None
+        max_episode_slots = 0
+        episode_max_steps = max_total_steps
+        if multi_episode_enabled:
+            raw_episode_max_steps = getattr(multi_episode_cfg, "episode_max_steps", None)
+            if raw_episode_max_steps is None:
+                episode_max_steps = max_total_steps
+            else:
+                episode_max_steps = int(raw_episode_max_steps)
+            episode_max_steps = max(1, min(episode_max_steps, max_total_steps))
+            episode_step_counts = np.zeros(batch_size, dtype=np.int32)
+            current_episode_ids = np.zeros(batch_size, dtype=np.int32)
+            max_episode_slots = max(1, max_total_steps // episode_max_steps)
+            per_episode_success_flags = np.full(
+                (max_episode_slots, batch_size), np.nan, dtype=np.float32
+            )
+            per_episode_lengths = np.full(
+                (max_episode_slots, batch_size), np.nan, dtype=np.float32
+            )
 
         # Initial observations from the environment
         obs, infos = envs.reset(kwargs=gen_batch.non_tensor_batch.pop('env_kwargs', None))
@@ -413,21 +443,33 @@ class TrajectoryCollector:
             episode_rewards[active_masks] += torch_to_numpy(rewards)[active_masks]
             episode_lengths[active_masks] += 1
             total_step_counts[active_masks] += 1
+            if multi_episode_enabled and episode_step_counts is not None:
+                episode_step_counts[active_masks] += 1
 
             reset_idx_set: set[int] = set()
             soft_reset_indices: list[int] = []
-            if multi_episode_enabled:
+            if multi_episode_enabled and episode_step_counts is not None:
+                episode_completions: list[tuple[int, str]] = []
                 for idx in range(batch_size):
+                    if not active_masks[idx]:
+                        continue
                     if dones[idx] and bool(infos[idx].get("won", False)):
                         success_counts[idx] += 1
+                        episode_completions.append((idx, "success"))
+                    elif episode_step_counts[idx] >= episode_max_steps:
+                        episode_completions.append((idx, "step_limit"))
 
-                for idx in range(batch_size):
-                    if (
-                        dones[idx]
-                        and bool(infos[idx].get("won", False))
-                        and total_step_counts[idx] < max_total_steps
-                    ):
-                        soft_reset_indices.append(idx)
+                for idx, reason in episode_completions:
+                    soft_reset_indices.append(idx)
+                    if per_episode_success_flags is not None and per_episode_lengths is not None:
+                        slot = int(current_episode_ids[idx])
+                        if slot < max_episode_slots:
+                            per_episode_success_flags[slot, idx] = 1.0 if reason == "success" else 0.0
+                            per_episode_lengths[slot, idx] = float(episode_step_counts[idx])
+                    current_episode_ids[idx] += 1
+                    infos[idx]["multi_episode_soft_reset_reason"] = reason
+                    infos[idx]["multi_episode_episode_step_count"] = int(episode_step_counts[idx])
+                    infos[idx]["multi_episode_episode_success"] = float(reason == "success")
 
                 if soft_reset_indices:
                     try:
@@ -447,6 +489,8 @@ class TrajectoryCollector:
                     for idx, updated_info in info_updates.items():
                         infos[idx] = updated_info
                         dones[idx] = False
+                        if episode_step_counts is not None:
+                            episode_step_counts[idx] = 0
 
             if not multi_episode_enabled:
                 reset_idx_set = set()
@@ -481,6 +525,14 @@ class TrajectoryCollector:
             if is_done.all():
                 break
         
+        if multi_episode_enabled and episode_step_counts is not None and per_episode_success_flags is not None:
+            for idx in range(batch_size):
+                if episode_step_counts[idx] > 0:
+                    slot = int(current_episode_ids[idx])
+                    if slot < max_episode_slots:
+                        per_episode_success_flags[slot, idx] = 0.0
+                        per_episode_lengths[slot, idx] = float(episode_step_counts[idx])
+
         if multi_episode_enabled:
             for idx in range(batch_size):
                 if total_infos[idx]:
@@ -497,6 +549,10 @@ class TrajectoryCollector:
             success['avg_successes_within_max_steps'] = success_counts.astype(np.float32)
             episode_rewards = success_counts.astype(np.float32) * reward_per_completion
             episode_lengths = total_step_counts.astype(np.float32)
+            if per_episode_success_flags is not None and per_episode_lengths is not None:
+                for slot in range(max_episode_slots):
+                    success[f"episode_{slot + 1}/success_rate"] = per_episode_success_flags[slot].copy()
+                    success[f"episode_{slot + 1}/length"] = per_episode_lengths[slot].copy()
         else:
             # Apply ALFWorld/WebShop-specific trajectory reward shaping if applicable:
             # desired: episode_reward = -T + 30 * I_success

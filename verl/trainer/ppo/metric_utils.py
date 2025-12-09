@@ -186,9 +186,16 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> Dict[str,
             batch.non_tensor_batch["tool_callings"][unique_idx].min().item(),
         **(
             {
-                f"episode/{k}": v[0].item()
+                (k if k.startswith("episode_") else f"episode/{k}"): v[0].item()
                 for k, v in batch.non_tensor_batch.items()
                 if "success_rate" in k
+            }
+        ),
+        **(
+            {
+                k: v[0].item()
+                for k, v in batch.non_tensor_batch.items()
+                if k.startswith("episode_") and k.endswith("/length")
             }
         ),
     }

@@ -11,7 +11,9 @@ val_data_size=128
 group_size=8
 prompt_type=vanilla
 history_length=30
-experiment_name=grpo_qwen2.5_1.5b_prompt_type_${prompt_type}_history_length_${history_length}
+env_max_steps=10
+experiment_name=grpo_qwen2.5_1.5b_prompt_type_${prompt_type}_history_length_${history_length}_env_max_steps_${env_max_steps}
+
 # We only use data preparation to indicate the modality and the data size.
 python3 -m examples.data_preprocess.prepare \
     --mode 'text' \
@@ -63,6 +65,7 @@ python3 -m verl.trainer.main_ppo \
     env.resources_per_worker.num_cpus=$num_cpus_per_env_worker \
     env.multi_episode_rollout.enable=True \
     env.multi_episode_rollout.reward_per_completion=1.0 \
+    env.multi_episode_rollout.episode_max_steps=$env_max_steps \
     trainer.critic_warmup=0 \
     trainer.logger=['console','wandb'] \
     trainer.project_name='verl_agent_alfworld' \
