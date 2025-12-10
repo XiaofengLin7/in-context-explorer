@@ -218,8 +218,8 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
         self.memory.reset(batch_size = len(text_obs))
         self.episode_ids = [0 for _ in range(len(text_obs))]
         self.episode_step_ids = [0 for _ in range(len(text_obs))]
-        self.episode_start_messages = [""] * len(text_obs)
         self.episode_labels = [""] * len(text_obs)
+        self.prev_episode_labels = [""] * len(text_obs)
         self.episode_step_ids = [0 for _ in range(len(text_obs))]
         self.tasks = []
         self.visited_receptacles = [set() for _ in range(len(text_obs))]
@@ -257,33 +257,30 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
             self.pre_text_obs[idx] = raw_text
             self.gamefile[idx] = info_map[idx].get("extra.gamefile", gamefiles[env_indices.index(idx)])
             last_episode_steps = self.episode_step_ids[idx]
+            if last_episode_steps == 0 and self.memory and len(self.memory[idx]) > 0:
+                last_episode_steps = int(self.memory[idx][-1].get("episode_step", 0))
             reason = prev_infos[idx].get("multi_episode_soft_reset_reason", "success")
             prev_episode = self.episode_ids[idx] + 1
             self.episode_ids[idx] += 1
             self.episode_step_ids[idx] = 0
             if self.multi_episode_enabled:
                 current_episode = self.episode_ids[idx] + 1
+                episode_cap = int(self.episode_max_steps or self.config.env.max_steps)
                 if reason == "success":
-                    message = (
-                        f"Previous episode {prev_episode} succeeded in {last_episode_steps} step(s). "
-                        f"Starting episode {current_episode}."
-                    )
                     label = f"previous episode {prev_episode} succeeded in {last_episode_steps} step(s)"
                 else:
-                    episode_cap = int(self.episode_max_steps or self.config.env.max_steps)
-                    message = (
-                        f"Previous episode {prev_episode} reached {last_episode_steps} step(s) "
-                        f"without success (per-episode cap: {episode_cap}). "
-                        f"Starting episode {current_episode}."
-                    )
                     label = (
                         f"previous episode {prev_episode} reached {last_episode_steps}/{episode_cap} step(s) "
                         f"without success"
                     )
-                self.episode_start_messages[idx] = message
-                self.episode_labels[idx] = label
+                # Tag the last record of the previous episode so history shows its outcome.
+                if self.memory and len(self.memory[idx]) > 0:
+                    self.memory[idx][-1]["episode_label"] = label
+                self.prev_episode_labels[idx] = label
+                self.episode_labels[idx] = ""
             else:
                 self.episode_labels[idx] = ""
+                self.prev_episode_labels[idx] = ""
 
         if self.config.env.prompt_type == 'gold':
             full_text_obs = self.build_text_obs_gold(self.pre_text_obs, self.envs.get_admissible_commands)
@@ -424,29 +421,66 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
                     episode_key="episode_id" if self.multi_episode_enabled else None,
                     episode_step_key="episode_step" if self.multi_episode_enabled else None,
                     episode_label_key="episode_label" if self.multi_episode_enabled else None)
+        episode_cap = int(self.episode_max_steps or self.config.env.max_steps) if self.multi_episode_enabled else None
 
         for i in range(len(text_obs)):
             # exclude 'help' in admissible_actions[i]
             reformatted_admissible_actions = "\n ".join(f"'{s}'" for s in admissible_actions[i] if s != 'help')
 
-            if init or self.config.env.history_length <= 0:
-                obs = ALFWORLD_TEMPLATE_NO_HIS.format(
-                    current_observation=text_obs[i],
-                    admissible_actions=reformatted_admissible_actions
-                )
+            if self.multi_episode_enabled:
+                previous_label = self.prev_episode_labels[i]
+                if not previous_label and self.memory and len(self.memory[i]) > 0:
+                    previous_label = self.memory[i][-1].get("episode_label", "")
+                if init or self.config.env.history_length <= 0:
+                    obs = ALFWORLD_TEMPLATE_MULTI_EPISODE_INIT.format(
+                        episode_cap=episode_cap,
+                        current_observation=text_obs[i],
+                        admissible_actions=reformatted_admissible_actions,
+                    )
+                else:
+                    history_text = memory_contexts[i] if memory_contexts is not None else ""
+                    current_ep = self.episode_ids[i] + 1
+                    if self.episode_step_ids[i] == 0:
+                        if not history_text:
+                            # No history yet for the new episode: include previous result if available.
+                            if previous_label:
+                                history_text = (
+                                    f"--- Previous episode result: {previous_label} ---\n"
+                                    f"--- Episode {current_ep} start ---"
+                                )
+                            else:
+                                history_text = f"--- Episode {current_ep} start ---"
+                        elif f"Episode {current_ep} start" not in history_text:
+                            history_text = f"{history_text}\n--- Episode {current_ep} start ---"
+                    obs = ALFWORLD_TEMPLATE_MULTI_EPISODE.format(
+                        task_description=self.tasks[i],
+                        step_count=len(self.memory[i]),
+                        history_length=valid_lens[i],
+                        action_history=history_text,
+                        current_episode=self.episode_ids[i] + 1,
+                        current_step=self.episode_step_ids[i] + 1,
+                        current_observation=text_obs[i],
+                        admissible_actions=reformatted_admissible_actions,
+                        episode_cap=episode_cap,
+                    )
             else:
-                history_text = memory_contexts[i] if memory_contexts is not None else ""
-                obs = ALFWORLD_TEMPLATE.format(
-                    task_description=self.tasks[i],
-                    step_count=len(self.memory[i]),
-                    history_length=valid_lens[i],
-                    action_history=history_text,
-                    current_step=len(self.memory[i]) + 1,
-                    current_observation=text_obs[i],
-                    admissible_actions=reformatted_admissible_actions
-                )
+                if init or self.config.env.history_length <= 0:
+                    obs = ALFWORLD_TEMPLATE_NO_HIS.format(
+                        current_observation=text_obs[i],
+                        admissible_actions=reformatted_admissible_actions
+                    )
+                else:
+                    history_text = memory_contexts[i] if memory_contexts is not None else ""
+                    obs = ALFWORLD_TEMPLATE.format(
+                        task_description=self.tasks[i],
+                        step_count=len(self.memory[i]),
+                        history_length=valid_lens[i],
+                        action_history=history_text,
+                        current_step=len(self.memory[i]) + 1,
+                        current_observation=text_obs[i],
+                        admissible_actions=reformatted_admissible_actions
+                    )
 
-            obs = self._prepend_episode_message(i, obs)
             postprocess_text_obs.append(obs)
         return postprocess_text_obs
     

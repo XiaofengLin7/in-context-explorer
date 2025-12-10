@@ -101,15 +101,20 @@ class SimpleMemory(BaseMemory):
                     episode_num = int(raw_episode) + 1
                     label = (rec.get(episode_label_key, "") or "").strip() if episode_label_key else ""
                     if prev_episode is None or episode_num != prev_episode:
-                        if label:
-                            lines.append(f"--- Episode {episode_num} start ({label}) ---")
-                        else:
-                            lines.append(f"--- Episode {episode_num} start ---")
+                        lines.append(f"--- Episode {episode_num} start ---")
                         prev_episode = episode_num
                     local_step = rec.get(episode_step_key, step_num)
                     lines.append(
                         f"[Episode {episode_num} | Observation {local_step}: '{obs}', Action {local_step}: '{act}']"
                     )
+                    # Emit previous episode result after the last record of that episode
+                    next_episode = None
+                    if j + 1 < len(recent):
+                        next_raw = recent[j + 1].get(episode_key, 0)
+                        next_episode = int(next_raw) + 1
+                    is_last_of_episode = next_episode is None or next_episode != episode_num
+                    if label and is_last_of_episode:
+                        lines.append(f"--- Previous episode result: {label} ---")
                 else:
                     lines.append(
                         f"[Observation {step_num}: '{obs}', Action {step_num}: '{act}']"

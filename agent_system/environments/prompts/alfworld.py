@@ -85,3 +85,23 @@ Now it's your turn to take an action.
 You should first reason step-by-step about the current situation. This reasoning process MUST be enclosed within <think> </think> tags. 
 Once you've finished your reasoning, you should choose an admissible action for current step and present it within <action> </action> tags.
 """
+
+ALFWORLD_TEMPLATE_MULTI_EPISODE_INIT = """
+You are an expert agent operating in the ALFRED Embodied Environment. Every episode resets on: success or after {episode_cap} step(s). Task is unchanged across episodes, so you can reuse what you learned from previous episodes.
+You are currently in episode 1 and your current observation is: {current_observation}
+Your admissible actions of the current situation are: [{admissible_actions}].
+
+Now it's your turn to take an action. You should reason step-by-step about the current situation before taking an action. This reasoning process MUST be enclosed within <think> </think> tags. 
+Once you've finished your reasoning, you should choose an admissible action for current step and present it within <action> </action> tags.
+"""
+
+ALFWORLD_TEMPLATE_MULTI_EPISODE = """
+You are an expert agent operating in the ALFRED Embodied Environment. Every episode resets on: success or after {episode_cap} step(s). Task is unchanged across episodes, so you can reuse what you learned from previous episodes. Your task is to: {task_description}
+Prior to this step, you have already taken {step_count} step(s). Below are the most recent {history_length} observations and the corresponding actions you took, including the episode label and results of previous episodes if applicable: {action_history}
+You are currently in episode {current_episode} and you are at step {current_step} and your current observation is: {current_observation}
+Your admissible actions of the current situation are: [{admissible_actions}].
+
+Now it's your turn to take an action.
+You should first reason step-by-step about the current situation. This reasoning process MUST be enclosed within <think> </think> tags. 
+Once you've finished your reasoning, you should choose an admissible action for current step and present it within <action> </action> tags.
+"""
