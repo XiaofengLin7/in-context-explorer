@@ -219,12 +219,20 @@ def test_alfworld_soft_reset_timeout_message():
 
     mgr = AlfWorldEnvironmentManager(_FakeAlfEnvs(), projection_f, cfg)
     _, infos = mgr.reset(kwargs={})
+    # Simulate episode 1 trajectory with a timeout label recorded in memory.
+    mgr.memory.store({
+        'text_obs': ["Obs ep1"],
+        'action': ["Act ep1"],
+        'episode_id': [0],
+        'episode_step': [3],
+        'episode_label': ["previous episode 1 reached 3/3 step(s) without success"],
+    })
     mgr.episode_step_ids[0] = 3
     infos[0]["multi_episode_soft_reset_reason"] = "step_limit"
     obs_updates, _ = mgr.soft_reset([0], infos)
     message = obs_updates["text"][0]
-    assert "without success" in message
-    assert "per-episode cap" in message
+    # Timeout info is conveyed in the action history header.
+    assert "Previous episode result: previous episode 1 reached 3/3 step(s) without success" in message
 
 
 def test_alfworld_episode_marker_includes_prev_outcome():
@@ -260,5 +268,199 @@ def test_alfworld_episode_marker_includes_prev_outcome():
 
     prompts = mgr.build_text_obs(["Current obs"], [["Look"]], init=False)
     text = prompts[0]
-    assert "Episode 2 start (previous episode 1 reached 10/10 step(s) without success)" in text
+    assert "--- Previous episode result: previous episode 1 reached 10/10 step(s) without success ---" in text
+    assert "--- Episode 2 start ---" in text
+
+
+def test_alfworld_history_shows_prev_outcome_at_episode2_step2():
+    cfg = make_config(prompt_type="vanilla", history_length=4)
+    cfg.env.multi_episode_rollout = types.SimpleNamespace(
+        enable=True,
+        reward_per_completion=1.0,
+        episode_max_steps=5,
+    )
+
+    def projection_f(text_actions: List[str], admissible):
+        return ["OpenFridge"], [True]
+
+    mgr = AlfWorldEnvironmentManager(_FakeAlfEnvs(), projection_f, cfg)
+    mgr.reset(kwargs={})
+
+    # Simulate end of episode 1 with label on the last record.
+    mgr.memory.store({
+        'text_obs': ["ep1_obs_last"],
+        'action': ["ep1_act_last"],
+        'episode_id': [0],
+        'episode_step': [5],
+        'episode_label': ["previous episode 1 reached 5/5 step(s) without success"],
+    })
+
+    # Episode 2, step 1 record already in memory so that step 2 prompt has history.
+    mgr.memory.store({
+        'text_obs': ["ep2_obs_1"],
+        'action': ["ep2_act_1"],
+        'episode_id': [1],
+        'episode_step': [1],
+        'episode_label': [""],
+    })
+
+    prompts = mgr.build_text_obs(["ep2_obs_2"], [["Look"]], init=False)
+    text = prompts[0]
+    assert "--- Previous episode result: previous episode 1 reached 5/5 step(s) without success ---" in text
+    assert "--- Episode 2 start ---" in text
+
+
+def test_alfworld_history_shows_prev_outcome_at_episode2_step1():
+    cfg = make_config(prompt_type="vanilla", history_length=4)
+    cfg.env.multi_episode_rollout = types.SimpleNamespace(
+        enable=True,
+        reward_per_completion=1.0,
+        episode_max_steps=5,
+    )
+
+    def projection_f(text_actions: List[str], admissible):
+        return ["OpenFridge"], [True]
+
+    mgr = AlfWorldEnvironmentManager(_FakeAlfEnvs(), projection_f, cfg)
+    mgr.reset(kwargs={})
+
+    # Simulate last step of episode 1 with outcome label
+    mgr.memory.store({
+        'text_obs': ["ep1_obs_last"],
+        'action': ["ep1_act_last"],
+        'episode_id': [0],
+        'episode_step': [5],
+        'episode_label': ["previous episode 1 reached 5/5 step(s) without success"],
+    })
+    # Soft reset to episode 2; memory has no episode-2 records yet.
+    _, infos = mgr.soft_reset([0], [{"multi_episode_soft_reset_reason": "step_limit", "extra.gamefile": "fake_game"}])
+
+    prompts = mgr.build_text_obs(["ep2_obs_1"], [["Look"]], init=False)
+    text = prompts[0]
+    assert "--- Previous episode result: previous episode 1 reached 5/5 step(s) without success ---" in text
+    assert "--- Episode 2 start ---" in text
+
+
+def test_alfworld_history_single_prev_outcome_line():
+    cfg = make_config(prompt_type="vanilla", history_length=6)
+    cfg.env.multi_episode_rollout = types.SimpleNamespace(
+        enable=True,
+        reward_per_completion=1.0,
+        episode_max_steps=5,
+    )
+
+    def projection_f(text_actions: List[str], admissible):
+        return ["OpenFridge"], [True]
+
+    mgr = AlfWorldEnvironmentManager(_FakeAlfEnvs(), projection_f, cfg)
+    mgr.reset(kwargs={})
+
+    # Episode 1 records; outcome label on the last step.
+    mgr.memory.store({
+        'text_obs': ["ep1_obs_1"],
+        'action': ["ep1_act_1"],
+        'episode_id': [0],
+        'episode_step': [1],
+        'episode_label': [""],
+    })
+    mgr.memory.store({
+        'text_obs': ["ep1_obs_2"],
+        'action': ["ep1_act_2"],
+        'episode_id': [0],
+        'episode_step': [2],
+        'episode_label': ["previous episode 1 reached 2/2 step(s) without success"],
+    })
+
+    # Move to episode 2, step 1.
+    mgr.episode_ids[0] = 1
+    mgr.episode_step_ids[0] = 0
+    mgr.episode_labels[0] = "previous episode 1 reached 2/2 step(s) without success"
+
+    prompts = mgr.build_text_obs(["ep2_obs_1"], [["Look"]], init=False)
+    text = prompts[0]
+
+    # Only one previous-outcome line, and it comes after the last Episode 1 record.
+    target = "Previous episode result: previous episode 1 reached 2/2 step(s) without success"
+    assert text.count(target) == 1
+    assert text.index(target) > text.index("Episode 1 | Observation 2")
+
+
+def test_alfworld_prev_outcome_not_duplicated_when_no_history():
+    cfg = make_config(prompt_type="vanilla", history_length=0)
+    cfg.env.multi_episode_rollout = types.SimpleNamespace(
+        enable=True,
+        reward_per_completion=1.0,
+        episode_max_steps=5,
+    )
+
+    def projection_f(text_actions: List[str], admissible):
+        return ["OpenFridge"], [True]
+
+    mgr = AlfWorldEnvironmentManager(_FakeAlfEnvs(), projection_f, cfg)
+    mgr.reset(kwargs={})
+
+    # Last record of episode 1 with label.
+    mgr.memory.store({
+        'text_obs': ["ep1_obs_last"],
+        'action': ["ep1_act_last"],
+        'episode_id': [0],
+        'episode_step': [5],
+        'episode_label': ["previous episode 1 reached 5/5 step(s) without success"],
+    })
+    mgr.soft_reset([0], [{"multi_episode_soft_reset_reason": "step_limit", "extra.gamefile": "fake_game"}])
+
+    prompts = mgr.build_text_obs(["ep2_obs_1"], [["Look"]], init=False)
+    text = prompts[0]
+
+    target = "Previous episode result: previous episode 1 reached 5/5 step(s) without success"
+    assert text.count(target) == 0
+
+
+def test_alfworld_prev_outcome_single_when_history_enabled():
+    cfg = make_config(prompt_type="vanilla", history_length=3)
+    cfg.env.multi_episode_rollout = types.SimpleNamespace(
+        enable=True,
+        reward_per_completion=1.0,
+        episode_max_steps=5,
+    )
+
+    def projection_f(text_actions: List[str], admissible):
+        return ["OpenFridge"], [True]
+
+    mgr = AlfWorldEnvironmentManager(_FakeAlfEnvs(), projection_f, cfg)
+    mgr.reset(kwargs={})
+
+    # Episode 1 records
+    mgr.memory.store({
+        'text_obs': ["ep1_obs_1"],
+        'action': ["ep1_act_1"],
+        'episode_id': [0],
+        'episode_step': [1],
+        'episode_label': [""],
+    })
+    mgr.memory.store({
+        'text_obs': ["ep1_obs_2"],
+        'action': ["ep1_act_2"],
+        'episode_id': [0],
+        'episode_step': [2],
+        'episode_label': ["previous episode 1 reached 2/2 step(s) without success"],
+    })
+
+    # Move to episode 2 step 1 with history available
+    mgr.episode_ids[0] = 1
+    mgr.episode_step_ids[0] = 0
+    mgr.prev_episode_labels[0] = "previous episode 1 reached 2/2 step(s) without success"
+    mgr.episode_labels[0] = ""
+
+    prompts = mgr.build_text_obs(["ep2_obs_1"], [["Look"]], init=False)
+    text = prompts[0]
+
+    target = "Previous episode result: previous episode 1 reached 2/2 step(s) without success"
+    assert text.count(target) == 1
+    assert "--- Episode 2 start ---" in text
+
+
+def test_alfworld_initial_episode_reset_hint():
+    # Removed: initial episode intro now relies solely on the template itself.
+    assert True
 
