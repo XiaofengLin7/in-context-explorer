@@ -29,6 +29,15 @@ pip3 install -e .
 pip3 install vllm==0.8.5
 pip3 install ray==2.49.0
 ```
+
+### GEM
+```
+conda activate verl-agent
+pip install -e agent_system/environments/env_package/gem/gem
+```
+
+#### Test your GEM
+run cell in agent_system/environments/env_package/gem/gem_demo.ipynb
 ## Experiments
 ### Training scripts
 configure your ALFWORLD_DATA first and your desired number of gpus in this training script first.
