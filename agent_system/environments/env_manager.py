@@ -754,6 +754,166 @@ class GymCardEnvironmentManager(EnvironmentManagerBase):
         return postprocess_text_obs
 
 
+class GemEnvironmentManager(EnvironmentManagerBase):
+    """
+    EnvironmentManager for GEM text-based games.
+    Uses SimpleMemory to keep a short history; prompts are the raw observations plus history.
+    """
+
+    def __init__(self, envs, projection_f, config):
+        self.memory = SimpleMemory()
+        super().__init__(envs, projection_f, config)
+        self.last_env_ids: List[str] = []
+        self.current_obs: List[str] = []
+        self.current_suffix: List[str] = []
+
+        multi_episode_cfg = getattr(config.env, "multi_episode_rollout", None)
+        self.multi_episode_enabled = bool(getattr(multi_episode_cfg, "enable", False)) if multi_episode_cfg else False
+        self.episode_max_steps = getattr(multi_episode_cfg, "episode_max_steps", None) if multi_episode_cfg else None
+        self.episode_ids: List[int] = []
+        self.episode_step_ids: List[int] = []
+        self.episode_labels: List[str] = []
+
+    def reset(self, kwargs) -> Tuple[Dict[str, Any], List[Dict]]:
+        obs, infos = self.envs.reset()
+        batch_size = len(obs)
+        self.memory.reset(batch_size=batch_size)
+        self.last_env_ids = [info.get("env_id", "") for info in infos]
+        self.current_obs = list(obs)
+        self.current_suffix = [str(info.get("suffix", "") or "") for info in infos]
+        self.episode_ids = [0 for _ in range(batch_size)]
+        self.episode_step_ids = [0 for _ in range(batch_size)]
+        self.episode_labels = ["" for _ in range(batch_size)]
+        observations = {
+            "text": self.build_text_obs(obs, init=True),
+            "image": None,
+            "anchor": obs.copy(),
+        }
+        return observations, infos
+
+    def step(self, text_actions: List[str]):
+        # Project using env_ids to allow action parsing per game
+        actions, valids = self.projection_f(text_actions, self.last_env_ids)
+        next_obs, rewards, dones, infos = self.envs.step(actions)
+
+        # increment episode step counters
+        for idx in range(len(actions)):
+            self.episode_step_ids[idx] += 1
+
+        # store history
+        self.memory.store({
+            "text_obs": self.current_obs,
+            "action": actions,
+            "episode_id": list(self.episode_ids),
+            "episode_step": list(self.episode_step_ids),
+            "episode_label": list(self.episode_labels),
+        })
+
+        self.last_env_ids = [info.get("env_id", "") for info in infos]
+        self.current_obs = list(next_obs)
+        self.current_suffix = [str(info.get("suffix", "") or "") for info in infos]
+        next_observations = {
+            "text": self.build_text_obs(next_obs, init=False),
+            "image": None,
+            "anchor": next_obs.copy(),
+        }
+        for i, info in enumerate(infos):
+            info["is_action_valid"] = to_numpy(valids[i])
+        rewards = to_numpy(rewards)
+        dones = to_numpy(dones)
+        return next_observations, rewards, dones, infos
+
+    def build_text_obs(self, text_obs: List[str], init: bool = False) -> List[str]:
+        """
+        Build prompt with optional recent history.
+        """
+        postprocess_text_obs: List[str] = []
+        episode_cap = int(self.episode_max_steps or self.config.env.max_steps)
+
+        if not init and self.config.env.history_length > 0:
+            action_histories, valid_lens = self.memory.fetch(
+                self.config.env.history_length,
+                obs_key="text_obs",
+                action_key="action",
+                episode_key="episode_id",
+                episode_step_key="episode_step",
+                episode_label_key="episode_label",
+            )
+        else:
+            action_histories = ["" for _ in range(len(text_obs))]
+            valid_lens = [0 for _ in range(len(text_obs))]
+
+        for i in range(len(text_obs)):
+            env_id = self.last_env_ids[i] if i < len(self.last_env_ids) else ""
+            suffix = self.current_suffix[i] if i < len(self.current_suffix) else ""
+
+            if init:
+                obs_i = GEM_TEMPLATE_MULTI_EPISODE_INIT.format(
+                    episode_cap=episode_cap,
+                    env_id=env_id,
+                    current_observation=str(text_obs[i]),
+                    task_suffix=suffix,
+                )
+            else:
+                obs_i = GEM_TEMPLATE_MULTI_EPISODE.format(
+                    episode_cap=episode_cap,
+                    env_id=env_id,
+                    step_count=len(self.memory[i]),
+                    history_length=valid_lens[i],
+                    action_history=action_histories[i],
+                    current_episode=self.episode_ids[i] + 1,
+                    current_step=self.episode_step_ids[i] + 1,
+                    current_observation=str(text_obs[i]),
+                    task_suffix=suffix,
+                )
+            postprocess_text_obs.append(obs_i)
+        return postprocess_text_obs
+
+    def soft_reset(self, env_indices, prev_infos=None):
+        """
+        Reset specified envs to their current task instances.
+        IMPORTANT: this does NOT clear agent memory/history (multi-episode rollout).
+        """
+        if not env_indices:
+            return {}, {}
+
+        env_indices = [int(idx) for idx in env_indices]
+        obs_map, info_map = self.envs.soft_reset(env_indices)
+
+        # Episode bookkeeping (mirror ALFWorld multi-episode semantics)
+        prev_infos = prev_infos or [None] * len(self.current_obs)
+        for idx in env_indices:
+            reason = (prev_infos[idx] or {}).get("multi_episode_soft_reset_reason", "success")
+            last_episode_steps = self.episode_step_ids[idx]
+            prev_episode = self.episode_ids[idx] + 1
+            self.episode_ids[idx] += 1
+            self.episode_step_ids[idx] = 0
+            if self.multi_episode_enabled:
+                episode_cap = int(self.episode_max_steps or self.config.env.max_steps)
+                if reason == "success":
+                    label = f"previous episode {prev_episode} succeeded in {last_episode_steps} step(s)"
+                else:
+                    label = f"previous episode {prev_episode} reached {last_episode_steps}/{episode_cap} step(s) without success"
+                if self.memory and len(self.memory[idx]) > 0:
+                    self.memory[idx][-1]["episode_label"] = label
+                self.episode_labels[idx] = ""
+
+        # Update cached current observations and env ids.
+        for idx in env_indices:
+            self.current_obs[idx] = obs_map[idx]
+            self.last_env_ids[idx] = info_map[idx].get("env_id", self.last_env_ids[idx])
+            self.current_suffix[idx] = str(info_map[idx].get("suffix", "") or "")
+
+        # Build full prompts (including history) and return only updates.
+        full_text_obs = self.build_text_obs(self.current_obs, init=False)
+        obs_updates = {"text": {}, "image": {}, "anchor": {}}
+        for idx in env_indices:
+            obs_updates["text"][idx] = full_text_obs[idx]
+            obs_updates["anchor"][idx] = self.current_obs[idx]
+
+        return obs_updates, info_map
+
+
 class WebshopEnvironmentManager(EnvironmentManagerBase):
     def __init__(self, envs, projection_f, config):
         self.memory = SimpleMemory()
@@ -1284,6 +1444,53 @@ def make_envs(config):
         projection_f = partial(webvoyager_projection)
         envs = WebVoyagerEnvironmentManager(_envs, projection_f, config)
         val_envs = WebVoyagerEnvironmentManager(_val_envs, projection_f, config)
+        return envs, val_envs
+    elif "gem" in config.env.env_name.lower():
+        from agent_system.environments.env_package.gem.builder import (
+            build_gem_envs,
+            gem_projection,
+            GEM_TASK_POOL_TRAIN,
+            GEM_TASK_POOL_EVAL,
+        )
+        gem_cfg = getattr(config.env, "gem", None)
+        # Default: use the fixed task pools defined in gem.builder.
+        use_default_pool = getattr(gem_cfg, "use_default_pool", True) if gem_cfg else True
+        if gem_cfg and getattr(gem_cfg, "env_ids", None) is not None:
+            env_ids = list(getattr(gem_cfg, "env_ids"))
+        elif use_default_pool:
+            env_ids = sorted({t["env_id"] for t in (GEM_TASK_POOL_TRAIN + GEM_TASK_POOL_EVAL)})
+        else:
+            env_ids = ["game:GuessTheNumber-v0-easy"]
+        task_pool_train = getattr(gem_cfg, "task_pool_train", None) if gem_cfg else None
+        task_pool_val = getattr(gem_cfg, "task_pool_val", None) if gem_cfg else None
+        max_steps = getattr(config.env, "max_steps", None)
+
+        _envs = build_gem_envs(
+            env_ids=env_ids,
+            seed=config.env.seed,
+            env_num=config.data.train_batch_size,
+            group_n=group_n,
+            max_steps=max_steps,
+            resources_per_worker=resources_per_worker,
+            task_pool=task_pool_train,
+            use_default_pool=use_default_pool and task_pool_train is None,
+            is_train=True,
+        )
+        _val_envs = build_gem_envs(
+            env_ids=env_ids,
+            seed=config.env.seed + 1000,
+            env_num=config.data.val_batch_size,
+            group_n=1,
+            max_steps=max_steps,
+            resources_per_worker=resources_per_worker,
+            task_pool=task_pool_val,
+            use_default_pool=use_default_pool and task_pool_val is None,
+            is_train=False,
+        )
+
+        projection_f = partial(gem_projection)
+        envs = GemEnvironmentManager(_envs, projection_f, config)
+        val_envs = GemEnvironmentManager(_val_envs, projection_f, config)
         return envs, val_envs
     elif "webarena" in config.env.env_name.lower():
         # use webvoyager envs to build webarena envs for now

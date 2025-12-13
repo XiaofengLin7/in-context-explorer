@@ -38,6 +38,44 @@ pip install -e agent_system/environments/env_package/gem/gem
 
 #### Test your GEM
 run cell in agent_system/environments/env_package/gem/gem_demo.ipynb
+
+#### Troubleshooting (common environment issues)
+
+##### 1) OmegaConf import error: `Could not deserialize ATN with version 3 (expected 4)`
+**Symptoms**
+- Importing `OmegaConf` / running training crashes when importing `agent_system/environments/env_manager.py` with:
+  - `Exception: Could not deserialize ATN with version 3 (expected 4).`
+
+**Cause**
+- `omegaconf==2.3.0` expects an older ANTLR runtime, but your environment has a newer
+  `antlr4-python3-runtime` installed (e.g., 4.13.x).
+
+**Fix (recommended for `omegaconf==2.3.0`)**
+```bash
+conda activate verl-agent
+pip install --no-deps --force-reinstall "antlr4-python3-runtime==4.9.3"
+python -c "from omegaconf import OmegaConf; print(OmegaConf.create({'ok': True}).ok)"
+```
+
+##### 2) Wordle/Hangman fails under Ray due to NLTK download races
+**Symptoms**
+- When initializing GEM Wordle/Hangman in parallel (Ray workers), you may see errors like:
+  - `FileExistsError: .../nltk_data/corpora/words`
+  - repeated `nltk.download("words")` messages from many workers
+
+**Cause**
+- GEM's Wordle/Hangman envs call `nltk.download("words")` in `__init__`, and concurrent
+  downloads can race.
+
+**Fix**
+- Pre-download the corpus once and/or set a stable cache directory:
+```bash
+conda activate verl-agent
+export NLTK_DATA="$HOME/.cache/nltk_data"
+python -c "import nltk; nltk.download('words', download_dir='$HOME/.cache/nltk_data')"
+```
+Note: this repo also adds a lightweight lock in the GEM wrapper to avoid concurrent
+downloads, but pre-downloading is still recommended on shared machines.
 ## Experiments
 ### Training scripts
 configure your ALFWORLD_DATA first and your desired number of gpus in this training script first.

@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import os
 import re
+import time
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import gem
@@ -44,7 +47,7 @@ class GemWorker:
 
         env_id, task_seed = self._sample_task()
         self.env_id = env_id
-        self.env = gem.make(env_id)
+        self.env = self._make_env(env_id)
         if task_seed is not None:
             self.env.reset(seed=task_seed)
 
@@ -75,7 +78,7 @@ class GemWorker:
             self.current_task = {"env_id": env_id, "seed": None}
 
         self.env_id = env_id
-        self.env = gem.make(env_id)
+        self.env = self._make_env(env_id)
         self._steps = 0
         obs, info = self.env.reset(seed=task_seed)
         info = info or {}
@@ -92,12 +95,72 @@ class GemWorker:
         env_id = self.current_task.get("env_id")
         task_seed = self.current_task.get("seed")
         self.env_id = env_id
-        self.env = gem.make(env_id)
+        self.env = self._make_env(env_id)
         self._steps = 0
         obs, info = self.env.reset(seed=task_seed)
         info = info or {}
         info["env_id"] = env_id
         return obs, info
+
+    def _make_env(self, env_id: str):
+        """
+        Create a GEM env instance.
+
+        Some GEM games (Wordle/Hangman) call `nltk.download("words")` during __init__,
+        which can race when many Ray actors initialize simultaneously. We pre-ensure
+        the corpus exists using a simple file lock.
+        """
+        if env_id.lower().startswith("game:wordle") or env_id.lower().startswith("game:hangman"):
+            _ensure_nltk_words()
+        return gem.make(env_id)
+
+
+def _ensure_nltk_words() -> None:
+    """
+    Ensure NLTK 'words' corpus exists, avoiding concurrent download races.
+    """
+    # Prefer user-provided NLTK_DATA; otherwise default to a per-user cache dir.
+    # This avoids hard-coding any lab-specific paths and works across machines.
+    default_dir = str(Path.home() / ".cache" / "nltk_data")
+    download_dir = os.environ.get("NLTK_DATA", default_dir)
+    Path(download_dir).mkdir(parents=True, exist_ok=True)
+
+    try:
+        import nltk  # type: ignore
+
+        if download_dir not in nltk.data.path:
+            nltk.data.path.insert(0, download_dir)
+        try:
+            nltk.data.find("corpora/words")
+            return
+        except LookupError:
+            pass
+
+        lock_path = Path(download_dir) / ".nltk_words.lock"
+        acquired = False
+        while not acquired:
+            try:
+                fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                os.close(fd)
+                acquired = True
+            except FileExistsError:
+                time.sleep(0.2)
+
+        try:
+            # Re-check under lock.
+            try:
+                nltk.data.find("corpora/words")
+                return
+            except LookupError:
+                nltk.download("words", download_dir=download_dir, quiet=True)
+        finally:
+            try:
+                lock_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+    except Exception:
+        # If nltk is not available or download fails, let GEM env raise its own error.
+        return
 
     def step(self, action: Any):
         obs, reward, terminated, truncated, info = self.env.step(action)
