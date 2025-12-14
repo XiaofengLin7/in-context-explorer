@@ -28,7 +28,8 @@ env_max_steps=30
 episode_max_steps=10
 
 # Model + optimization knobs
-model_path=Qwen/Qwen3-1.7B
+# model_path=Qwen/Qwen3-1.7B
+model_path=Qwen/Qwen2.5-1.5B-Instruct
 
 experiment_name=grpo_gem_multitask_${model_path}
 
@@ -43,7 +44,7 @@ python3 -m verl.trainer.main_ppo \
   data.val_files=$HOME/data/verl-agent/text/test.parquet \
   data.train_batch_size=$train_data_size \
   data.val_batch_size=$val_data_size \
-  data.max_prompt_length=10240 \
+  data.max_prompt_length=16384 \
   data.max_response_length=256 \
   data.filter_overlong_prompts=True \
   data.truncation='error' \
