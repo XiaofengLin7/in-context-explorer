@@ -38,6 +38,68 @@ pip install -e agent_system/environments/env_package/gem/gem
 
 #### Test your GEM
 run cell in agent_system/environments/env_package/gem/gem_demo.ipynb
+
+#### Soft reset / multi-episode rollout semantics (GEM)
+GEM training commonly uses **multi-episode rollout**: a single rollout trajectory is split into multiple
+"episodes" on the **same task instance**, without clearing the agent's history buffer. This is implemented
+via `soft_reset`.
+
+**What triggers a `soft_reset` (when `env.multi_episode_rollout.enable=True`)**
+- **Success**: when the env ends and `info["won"] == True` (GEM uses terminal "Congratulations!" messages).
+- **Episode step limit**: when the per-episode step counter reaches `env.multi_episode_rollout.episode_max_steps`.
+- **Internal max turns**: when a GEM game ends due to its inherent `max_turns` (the env truncates with a message
+  containing "maximum number of turns"). We tag this as `info["internal_max_turns"] == True` and soft-reset.
+- **Any other terminal** (GEM only): format errors, failures, etc. also trigger a soft reset (reason: `"terminal"`).
+  This keeps the trajectory length consistent (i.e. `episode_length` reaches `env.max_steps`) while still letting the
+  policy learn from failures.
+
+**Important interaction of step limits**
+- Each GEM game has its own `max_turns` (e.g. Minesweeper-easy: 25). Our code also supports an outer cap
+  `env.max_steps` (trajectory length) and `episode_max_steps` (episode length within the trajectory).
+- If you want soft resets to happen *because of internal max turns*, set:
+  `env.multi_episode_rollout.episode_max_steps >= max(max_turns)` across your task pool.
+
+**What happens on `soft_reset`**
+- The environment resets to the **same (env_id, seed)** task instance.
+- The agent memory/history is **not** cleared; episode boundary/result text is appended into history.
+
+#### Troubleshooting (common environment issues)
+
+##### 1) OmegaConf import error: `Could not deserialize ATN with version 3 (expected 4)`
+**Symptoms**
+- Importing `OmegaConf` / running training crashes when importing `agent_system/environments/env_manager.py` with:
+  - `Exception: Could not deserialize ATN with version 3 (expected 4).`
+
+**Cause**
+- `omegaconf==2.3.0` expects an older ANTLR runtime, but your environment has a newer
+  `antlr4-python3-runtime` installed (e.g., 4.13.x).
+
+**Fix (recommended for `omegaconf==2.3.0`)**
+```bash
+conda activate verl-agent
+pip install --no-deps --force-reinstall "antlr4-python3-runtime==4.9.3"
+python -c "from omegaconf import OmegaConf; print(OmegaConf.create({'ok': True}).ok)"
+```
+
+##### 2) Wordle/Hangman fails under Ray due to NLTK download races
+**Symptoms**
+- When initializing GEM Wordle/Hangman in parallel (Ray workers), you may see errors like:
+  - `FileExistsError: .../nltk_data/corpora/words`
+  - repeated `nltk.download("words")` messages from many workers
+
+**Cause**
+- GEM's Wordle/Hangman envs call `nltk.download("words")` in `__init__`, and concurrent
+  downloads can race.
+
+**Fix**
+- Pre-download the corpus once and/or set a stable cache directory:
+```bash
+conda activate verl-agent
+export NLTK_DATA="$HOME/.cache/nltk_data"
+python -c "import nltk; nltk.download('words', download_dir='$HOME/.cache/nltk_data')"
+```
+Note: this repo also adds a lightweight lock in the GEM wrapper to avoid concurrent
+downloads, but pre-downloading is still recommended on shared machines.
 ## Experiments
 ### Training scripts
 configure your ALFWORLD_DATA first and your desired number of gpus in this training script first.
