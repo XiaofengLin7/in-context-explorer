@@ -73,6 +73,7 @@ class DummyEnvManager:
         dones = np.array([event["done"]], dtype=bool)
         infos = [{
             "won": event["won"],
+            "internal_max_turns": bool(event.get("internal_max_turns", False)),
             "is_action_valid": True,
             "extra.gamefile": "dummy_task",
         }]
@@ -136,6 +137,64 @@ def make_gen_batch(batch_size: int = 1) -> DataProto:
     }
     return DataProto(batch=tensor_dict, non_tensor_batch=non_tensors)
 
+def make_gen_batch_multi(batch_size: int) -> DataProto:
+    """Like make_gen_batch, but creates correctly-sized non-tensor fields."""
+    tensors = {
+        "input_ids": torch.zeros((batch_size, 1), dtype=torch.long),
+        "attention_mask": torch.ones((batch_size, 1), dtype=torch.long),
+        "position_ids": torch.zeros((batch_size, 1), dtype=torch.long),
+    }
+    tensor_dict = TensorDict(source=tensors, batch_size=(batch_size,))
+    non_tensors = {
+        "raw_prompt": np.array(["hello"] * batch_size, dtype=object),
+        "raw_prompt_ids": np.array([[0, 1]] * batch_size, dtype=object),
+        "data_source": np.array(["train"] * batch_size, dtype=object),
+        "env_kwargs": np.array([None] * batch_size, dtype=object),
+    }
+    return DataProto(batch=tensor_dict, non_tensor_batch=non_tensors)
+
+
+class DummyEnvManagerMulti:
+    """Batch env that can terminate every step for all envs."""
+
+    def __init__(self, batch_size: int):
+        self.batch_size = batch_size
+        self.step_calls = 0
+        self.soft_reset_calls = 0
+
+    def reset(self, kwargs=None):
+        self.step_calls = 0
+        self.soft_reset_calls = 0
+        obs = {"text": ["init"] * self.batch_size, "image": None, "anchor": ["init"] * self.batch_size}
+        infos = [{"won": False, "internal_max_turns": False, "is_action_valid": True} for _ in range(self.batch_size)]
+        return obs, infos
+
+    def step(self, text_actions: List[str]):
+        self.step_calls += 1
+        obs = {
+            "text": [f"step-{self.step_calls}"] * self.batch_size,
+            "image": None,
+            "anchor": [f"step-{self.step_calls}"] * self.batch_size,
+        }
+        rewards = np.zeros((self.batch_size,), dtype=np.float32)
+        dones = np.ones((self.batch_size,), dtype=bool)  # done every step
+        infos = [{"won": False, "internal_max_turns": False, "is_action_valid": True} for _ in range(self.batch_size)]
+        return obs, rewards, dones, infos
+
+    def soft_reset(self, indices: List[int], infos: List[Dict]):
+        self.soft_reset_calls += 1
+        obs_updates = {"text": {}, "image": {}, "anchor": {}}
+        info_updates = {}
+        for idx in indices:
+            obs_updates["text"][idx] = f"reset-{self.soft_reset_calls}"
+            obs_updates["anchor"][idx] = f"reset-{self.soft_reset_calls}"
+            info_updates[idx] = {"won": False, "internal_max_turns": False, "is_action_valid": True}
+        return obs_updates, info_updates
+
+    def success_evaluator(self, total_infos, **kwargs):
+        # no success
+        return {"success_rate": np.zeros((self.batch_size,), dtype=np.float32)}
+
 
 def test_multi_episode_reward_and_success_counter():
     collector = DummyCollector(make_config(), DummyTokenizer())
@@ -149,7 +208,9 @@ def test_multi_episode_reward_and_success_counter():
         envs=env,
     )
 
-    assert env.soft_reset_calls == 4
+    # The loop no longer soft-resets on the final step when we are already at the
+    # trajectory budget (`env.max_steps`), since that reset would be unused.
+    assert env.soft_reset_calls == 3
     assert success["avg_successes_within_max_steps"][0] == pytest.approx(2.0)
     assert success["success_rate"][0] == pytest.approx(1.0)
     assert success["pick_two_obj_and_place_success_rate"][0] == pytest.approx(1.0)
@@ -163,4 +224,102 @@ def test_multi_episode_reward_and_success_counter():
     assert success["episode_4/length"][0] == pytest.approx(2.0)
     assert episode_rewards[0] == pytest.approx(4.0)
     assert episode_lengths[0] == pytest.approx(8.0)
+
+
+def test_multi_episode_soft_reset_on_internal_max_turns():
+    """
+    When an env ends due to its internal max turns, we should soft-reset in multi-episode mode.
+    """
+    cfg = make_config()
+    cfg.env.env_name = "gem"
+    # Make episode_max_steps large so internal_max_turns is the trigger.
+    cfg.env.multi_episode_rollout.episode_max_steps = 99
+
+    collector = DummyCollector(cfg, DummyTokenizer())
+    env = DummyEnvManager()
+    # One internal-max-turn termination, then keep running until global max_steps ends.
+    env.plan = [
+        {"done": True, "won": False, "reward": 0.0, "internal_max_turns": True},
+        {"done": False, "won": False, "reward": 0.0},
+        {"done": False, "won": False, "reward": 0.0},
+        {"done": False, "won": False, "reward": 0.0},
+        {"done": False, "won": False, "reward": 0.0},
+        {"done": False, "won": False, "reward": 0.0},
+        {"done": False, "won": False, "reward": 0.0},
+        {"done": False, "won": False, "reward": 0.0},
+    ]
+    actor = DummyActorWorkerGroup()
+    gen_batch = make_gen_batch()
+
+    _, episode_rewards, episode_lengths, success, _, _ = collector.vanilla_multi_turn_loop(
+        gen_batch=gen_batch,
+        actor_rollout_wg=actor,
+        envs=env,
+    )
+
+    # Should soft-reset at least once due to internal_max_turns, and still finish the trajectory.
+    assert env.soft_reset_calls >= 1
+    assert episode_lengths[0] == pytest.approx(cfg.env.max_steps)
+    assert success["success_rate"][0] == pytest.approx(0.0)
+    assert episode_rewards[0] == pytest.approx(0.0)
+
+
+def test_multi_episode_soft_reset_on_terminal_failure_for_gem():
+    """
+    For GEM, any terminal (done=True) without success should soft-reset in multi-episode mode.
+    """
+    cfg = make_config()
+    cfg.env.env_name = "gem"
+    # Make episode_max_steps large so terminal done is the trigger.
+    cfg.env.multi_episode_rollout.episode_max_steps = 99
+
+    collector = DummyCollector(cfg, DummyTokenizer())
+    env = DummyEnvManager()
+    # A terminal failure that is NOT success and NOT internal_max_turns.
+    env.plan = [
+        {"done": True, "won": False, "reward": -1.0, "internal_max_turns": False},
+        {"done": False, "won": False, "reward": 0.0},
+        {"done": False, "won": False, "reward": 0.0},
+        {"done": False, "won": False, "reward": 0.0},
+        {"done": False, "won": False, "reward": 0.0},
+        {"done": False, "won": False, "reward": 0.0},
+        {"done": False, "won": False, "reward": 0.0},
+        {"done": False, "won": False, "reward": 0.0},
+    ]
+    actor = DummyActorWorkerGroup()
+    gen_batch = make_gen_batch()
+
+    _, episode_rewards, episode_lengths, success, _, _ = collector.vanilla_multi_turn_loop(
+        gen_batch=gen_batch,
+        actor_rollout_wg=actor,
+        envs=env,
+    )
+
+    assert env.soft_reset_calls >= 1
+    assert episode_lengths[0] == pytest.approx(cfg.env.max_steps)
+    assert success["success_rate"][0] == pytest.approx(0.0)
+
+
+def test_gem_episode_length_reaches_max_steps_for_all_envs():
+    """Regression: for GEM, soft-reset on any done keeps all episode lengths at env.max_steps."""
+    cfg = make_config()
+    cfg.env.env_name = "gem"
+    cfg.env.max_steps = 8
+    cfg.env.multi_episode_rollout.episode_max_steps = 99
+    batch_size = 4
+
+    collector = DummyCollector(cfg, DummyTokenizer())
+    env = DummyEnvManagerMulti(batch_size=batch_size)
+    actor = DummyActorWorkerGroup()
+    gen_batch = make_gen_batch_multi(batch_size=batch_size)
+
+    _, episode_rewards, episode_lengths, success, _, _ = collector.vanilla_multi_turn_loop(
+        gen_batch=gen_batch,
+        actor_rollout_wg=actor,
+        envs=env,
+    )
+
+    assert float(np.min(episode_lengths)) == pytest.approx(float(cfg.env.max_steps))
+    assert float(np.max(episode_lengths)) == pytest.approx(float(cfg.env.max_steps))
+    assert float(np.min(success["success_rate"])) == pytest.approx(0.0)
 

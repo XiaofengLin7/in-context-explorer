@@ -453,9 +453,22 @@ class TrajectoryCollector:
                 for idx in range(batch_size):
                     if not active_masks[idx]:
                         continue
+                    # If we've already collected the full trajectory budget for this env, do not soft-reset.
+                    # We want to end cleanly at env.max_steps.
+                    if int(total_step_counts[idx]) >= int(max_total_steps):
+                        continue
                     if dones[idx] and bool(infos[idx].get("won", False)):
                         success_counts[idx] += 1
                         episode_completions.append((idx, "success"))
+                    # For GEM games, we tag internal max-turn termination explicitly via info["internal_max_turns"].
+                    # We want multi-episode rollout to soft-reset (same task instance) in that case,
+                    # instead of ending the whole trajectory early.
+                    elif dones[idx] and bool(infos[idx].get("internal_max_turns", False)):
+                        episode_completions.append((idx, "internal_max_turns"))
+                    # For GEM games, any other terminal (failure / format error / etc.) should also soft-reset.
+                    # This keeps the trajectory length consistent and lets the policy learn from failures.
+                    elif "gem" in self.config.env.env_name.lower() and dones[idx]:
+                        episode_completions.append((idx, "terminal"))
                     elif episode_step_counts[idx] >= episode_max_steps:
                         episode_completions.append((idx, "step_limit"))
 

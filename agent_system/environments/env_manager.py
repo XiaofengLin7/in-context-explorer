@@ -801,9 +801,17 @@ class GemEnvironmentManager(EnvironmentManagerBase):
             self.episode_step_ids[idx] += 1
 
         # store history
+        # If the action is invalid, store a short placeholder instead of the raw model output.
+        # This keeps history compact and avoids polluting it with long reasoning text.
+        stored_actions: List[Any] = []
+        for act, valid in zip(actions, valids):
+            if bool(valid):
+                stored_actions.append(act)
+            else:
+                stored_actions.append("Invalid action (ignored). Please respond with a single valid \\boxed{...} action.")
         self.memory.store({
             "text_obs": self.current_obs,
-            "action": actions,
+            "action": stored_actions,
             "episode_id": list(self.episode_ids),
             "episode_step": list(self.episode_step_ids),
             "episode_label": list(self.episode_labels),
@@ -827,6 +835,10 @@ class GemEnvironmentManager(EnvironmentManagerBase):
         """
         Build prompt with optional recent history.
         """
+        def _escape_braces(text: str) -> str:
+            # Observations/actions often contain `\boxed{...}` which breaks `str.format`.
+            return text.replace("{", "{{").replace("}", "}}")
+
         postprocess_text_obs: List[str] = []
         episode_cap = int(self.episode_max_steps or self.config.env.max_steps)
 
@@ -846,13 +858,16 @@ class GemEnvironmentManager(EnvironmentManagerBase):
         for i in range(len(text_obs)):
             env_id = self.last_env_ids[i] if i < len(self.last_env_ids) else ""
             suffix = self.current_suffix[i] if i < len(self.current_suffix) else ""
+            safe_obs = _escape_braces(str(text_obs[i]))
+            safe_suffix = _escape_braces(str(suffix))
+            safe_history = _escape_braces(str(action_histories[i])) if i < len(action_histories) else ""
 
             if init:
                 obs_i = GEM_TEMPLATE_MULTI_EPISODE_INIT.format(
                     episode_cap=episode_cap,
                     env_id=env_id,
-                    current_observation=str(text_obs[i]),
-                    task_suffix=suffix,
+                    current_observation=safe_obs,
+                    task_suffix=safe_suffix,
                 )
             else:
                 obs_i = GEM_TEMPLATE_MULTI_EPISODE.format(
@@ -860,11 +875,11 @@ class GemEnvironmentManager(EnvironmentManagerBase):
                     env_id=env_id,
                     step_count=len(self.memory[i]),
                     history_length=valid_lens[i],
-                    action_history=action_histories[i],
+                    action_history=safe_history,
                     current_episode=self.episode_ids[i] + 1,
                     current_step=self.episode_step_ids[i] + 1,
-                    current_observation=str(text_obs[i]),
-                    task_suffix=suffix,
+                    current_observation=safe_obs,
+                    task_suffix=safe_suffix,
                 )
             postprocess_text_obs.append(obs_i)
         return postprocess_text_obs
@@ -892,6 +907,10 @@ class GemEnvironmentManager(EnvironmentManagerBase):
                 episode_cap = int(self.episode_max_steps or self.config.env.max_steps)
                 if reason == "success":
                     label = f"previous episode {prev_episode} succeeded in {last_episode_steps} step(s)"
+                elif reason == "internal_max_turns":
+                    label = f"previous episode {prev_episode} reached internal max turns in {last_episode_steps} step(s) without success"
+                elif reason == "terminal":
+                    label = f"previous episode {prev_episode} ended (failure/format error) in {last_episode_steps} step(s) without success"
                 else:
                     label = f"previous episode {prev_episode} reached {last_episode_steps}/{episode_cap} step(s) without success"
                 if self.memory and len(self.memory[idx]) > 0:
@@ -912,6 +931,28 @@ class GemEnvironmentManager(EnvironmentManagerBase):
             obs_updates["anchor"][idx] = self.current_obs[idx]
 
         return obs_updates, info_map
+
+    def _process_batch(self, batch_idx, total_batch_list, total_infos, success):
+        """
+        Add GEM per-env_id metrics in addition to overall success_rate.
+        """
+        # Find the last entry with active masks
+        last_active_i = None
+        for i in reversed(range(len(total_batch_list[batch_idx]))):
+            if total_batch_list[batch_idx][i].get("active_masks"):
+                last_active_i = i
+                break
+        if last_active_i is None:
+            success["success_rate"].append(0.0)
+            return
+
+        final_info = total_infos[batch_idx][last_active_i]
+        won_value = float(final_info.get("won", 0.0))
+        success["success_rate"].append(won_value)
+
+        env_id = str(final_info.get("env_id", "unknown"))
+        env_key = env_id.replace(":", "_").replace("-", "_")
+        success.setdefault(f"{env_key}_success_rate", []).append(won_value)
 
 
 class WebshopEnvironmentManager(EnvironmentManagerBase):

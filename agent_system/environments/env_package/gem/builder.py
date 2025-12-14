@@ -10,20 +10,55 @@ import gem
 import numpy as np
 import ray
 
+# ------------------- Default GEM task pools ------------------- #
 # Default task pools (fixed env_id + seed) for reproducible sampling.
-GEM_TASK_POOL_TRAIN: List[Dict[str, Any]] = [
-    {"env_id": "game:GuessTheNumber-v0-easy", "seed": 0},
-    {"env_id": "game:Mastermind-v0-easy", "seed": 1},
-    {"env_id": "game:Minesweeper-v0-easy", "seed": 2},
-    {"env_id": "game:Sudoku-v0-easy", "seed": 3},
-    {"env_id": "game:Hangman-v0-easy", "seed": 4},
-    {"env_id": "game:TowerofHanoi-v0-easy", "seed": 5},
+#
+# We intentionally include MANY fixed seeds per game to reduce variance and
+# avoid overfitting to a single instance.
+GEM_TRAIN_ENV_IDS: List[str] = [
+    "game:GuessTheNumber-v0-easy",
+    "game:Mastermind-v0-easy",
+    "game:Minesweeper-v0-easy",
+    "game:Sudoku-v0-easy",
+    "game:Hangman-v0-easy",
+    "game:TowerofHanoi-v0-easy",
 ]
 
-GEM_TASK_POOL_EVAL: List[Dict[str, Any]] = [
-    {"env_id": "game:Wordle-v0-easy", "seed": 100},
-    {"env_id": "game:FifteenPuzzle-v0-easy", "seed": 101},
+GEM_EVAL_ENV_IDS: List[str] = [
+    "game:Wordle-v0-easy",
+    "game:FifteenPuzzle-v0-easy",
 ]
+
+DEFAULT_GEM_TRAIN_NUM_SEEDS = 100
+DEFAULT_GEM_EVAL_NUM_SEEDS = 100
+
+
+def _build_task_pool(env_ids: Sequence[str], num_seeds: int, seed_base: int) -> List[Dict[str, Any]]:
+    """
+    Build a deterministic (env_id, seed) task pool.
+
+    We offset each env's seed range to avoid accidental collisions across games.
+    """
+    pool: List[Dict[str, Any]] = []
+    stride = 100_000
+    for env_idx, env_id in enumerate(env_ids):
+        base = seed_base + env_idx * stride
+        for k in range(int(num_seeds)):
+            pool.append({"env_id": env_id, "seed": int(base + k)})
+    return pool
+
+
+GEM_TASK_POOL_TRAIN: List[Dict[str, Any]] = _build_task_pool(
+    env_ids=GEM_TRAIN_ENV_IDS,
+    num_seeds=DEFAULT_GEM_TRAIN_NUM_SEEDS,
+    seed_base=0,
+)
+
+GEM_TASK_POOL_EVAL: List[Dict[str, Any]] = _build_task_pool(
+    env_ids=GEM_EVAL_ENV_IDS,
+    num_seeds=DEFAULT_GEM_EVAL_NUM_SEEDS,
+    seed_base=1_000_000,
+)
 
 class GemWorker:
     """
@@ -112,7 +147,45 @@ class GemWorker:
         """
         if env_id.lower().startswith("game:wordle") or env_id.lower().startswith("game:hangman"):
             _ensure_nltk_words()
+            # GEM's Wordle/Hangman envs still call nltk.download("words") (non-quiet) in __init__,
+            # which spams logs across Ray workers. Temporarily force quiet=True.
+            try:
+                import nltk  # type: ignore
+
+                original_download = nltk.download
+
+                def _quiet_download(*args: Any, **kwargs: Any):
+                    kwargs.setdefault("quiet", True)
+                    return original_download(*args, **kwargs)
+
+                nltk.download = _quiet_download  # type: ignore[assignment]
+                return gem.make(env_id)
+            finally:
+                try:
+                    nltk.download = original_download  # type: ignore[assignment]
+                except Exception:
+                    pass
         return gem.make(env_id)
+
+    def step(self, action: Any):
+        obs, reward, terminated, truncated, info = self.env.step(action)
+        self._steps += 1
+        done = bool(terminated or truncated)
+        if self.max_steps is not None and self._steps >= self.max_steps:
+            done = True
+        info = info or {}
+        info.setdefault("env_id", self.env_id)
+        # Emit a unified success signal for multi-episode rollout logic.
+        # GEM game envs consistently use "Congratulations!" for success terminal messages.
+        won = bool(terminated) and str(obs).lstrip().startswith("Congratulations!")
+        info["won"] = won
+        info["terminated"] = bool(terminated)
+        info["truncated"] = bool(truncated)
+        # Detect "internal max turns" termination from GEM envs.
+        # GEM game envs consistently emit "You have reached the maximum number of turns" on this condition.
+        obs_text = str(obs)
+        info["internal_max_turns"] = bool(truncated) and ("maximum number of turns" in obs_text.lower())
+        return obs, float(reward), done, info
 
 
 def _ensure_nltk_words() -> None:
@@ -161,16 +234,6 @@ def _ensure_nltk_words() -> None:
     except Exception:
         # If nltk is not available or download fails, let GEM env raise its own error.
         return
-
-    def step(self, action: Any):
-        obs, reward, terminated, truncated, info = self.env.step(action)
-        self._steps += 1
-        done = bool(terminated or truncated)
-        if self.max_steps is not None and self._steps >= self.max_steps:
-            done = True
-        info = info or {}
-        info.setdefault("env_id", self.env_id)
-        return obs, float(reward), done, info
 
 
 class GemMultiProcessEnv:
@@ -330,23 +393,56 @@ def gem_projection(
     """
     Projection function to map model text to GEM actions.
 
-    - If env_id suggests a numeric guess game, try to parse \\boxed{number}.
-    - Otherwise, pass through the raw text.
+    GEM games generally parse the *last* \\boxed{...} in the model output.
+    To reduce format errors, we:
+      - extract the last \\boxed{...} if present and send only that
+      - validate the extracted content with a per-game regex
     """
+
+    def _extract_last_boxed(text: str) -> Optional[str]:
+        matches = list(re.finditer(r"\\boxed\{([^}]*)\}", text, flags=re.DOTALL))
+        if not matches:
+            return None
+        return matches[-1].group(1).strip()
+
+    def _wrap_boxed(content: str) -> str:
+        return f"\\boxed{{{content.strip()}}}"
+
+    def _is_valid_for_env(env_id: str, boxed_content: str) -> bool:
+        eid = env_id.lower()
+        c = boxed_content.strip()
+        if eid.startswith("game:guessthenumber"):
+            return re.fullmatch(r"[+-]?\d+", c) is not None
+        if eid.startswith("game:mastermind"):
+            # e.g. "1 2" or "1 2 3 4"
+            return re.fullmatch(r"(?:\d+\s+)*\d+", c) is not None
+        if eid.startswith("game:minesweeper"):
+            return re.fullmatch(r"(reveal|flag)\s+\d+\s+\d+", c, flags=re.IGNORECASE) is not None
+        if eid.startswith("game:sudoku"):
+            return re.fullmatch(r"\d+\s+\d+\s+\d+", c) is not None
+        if eid.startswith("game:hangman"):
+            return re.fullmatch(r"[a-zA-Z]+(?:\s+[a-zA-Z]+)*", c) is not None
+        if eid.startswith("game:towerofhanoi"):
+            return re.fullmatch(r"[ABCabc]\s*,?\s*[ABCabc]", c) is not None
+        if eid.startswith("game:wordle"):
+            return re.fullmatch(r"[a-zA-Z]+(?:\s+[a-zA-Z]+)*", c) is not None
+        if eid.startswith("game:fifteenpuzzle"):
+            return re.fullmatch(r"(up|down|left|right)", c, flags=re.IGNORECASE) is not None
+        # Fallback: if it is boxed, accept it.
+        return True
+
     actions: List[Any] = []
     valids: List[bool] = []
     for idx, act in enumerate(text_actions):
-        env_id = env_ids[idx] if env_ids is not None and idx < len(env_ids) else None
-        action = act
-        valid = True
-
-        # Heuristic: numeric guessing games start with "game:GuessTheNumber"
-        if env_id and env_id.lower().startswith("game:guessthenumber"):
-            parsed = _parse_boxed_number(act)
-            if parsed is not None:
-                action = act  # keep original string; GEM expects string input
-            else:
-                valid = False
+        env_id = env_ids[idx] if env_ids is not None and idx < len(env_ids) else ""
+        boxed = _extract_last_boxed(act)
+        if boxed is None:
+            # Enforce protocol strictly: action must contain exactly one \\boxed{...}.
+            action = act
+            valid = False
+        else:
+            action = _wrap_boxed(boxed)
+            valid = _is_valid_for_env(env_id, boxed)
         actions.append(action)
         valids.append(valid)
     return actions, valids

@@ -19,7 +19,12 @@ You are currently in episode 1 and your current observation is:
 Now it's your turn to take an action.
 - You MUST first reason step-by-step in <think>...</think>.
 - Then you MUST output the action to send to the environment inside <action>...</action>.
-- The <action> content MUST follow the game's required format (usually includes a \\boxed{...} command).
+- The <action> content MUST follow the game's required format (usually includes a \\boxed{{...}} command).
+- In <action>, output EXACTLY ONE \\boxed{{...}} command and nothing else (no extra words, no multiple boxed actions).
+
+Output format example (follow this exactly):
+<think>...</think>
+<action>\\boxed{{up}}</action>
 """
 
 GEM_TEMPLATE_MULTI_EPISODE = """
@@ -39,7 +44,12 @@ Current observation:
 Now it's your turn to take an action.
 - You MUST first reason step-by-step in <think>...</think>.
 - Then you MUST output the action to send to the environment inside <action>...</action>.
-- The <action> content MUST follow the game's required format (usually includes a \\boxed{...} command).
+- The <action> content MUST follow the game's required format (usually includes a \\boxed{{...}} command).
+- In <action>, output EXACTLY ONE \\boxed{{...}} command and nothing else (no extra words, no multiple boxed actions).
+
+Output format example (follow this exactly):
+<think>...</think>
+<action>\\boxed{{up}}</action>
 """
 
 # Backward-compatible alias used by early experiments.
