@@ -63,6 +63,37 @@ via `soft_reset`.
 - The environment resets to the **same (env_id, seed)** task instance.
 - The agent memory/history is **not** cleared; episode boundary/result text is appended into history.
 
+#### Single-task GEM training (no extra config files)
+If you want to train on just one GEM game and keep your launch clean, disable the default multi-task pool and set a single env id. Seeds will be sampled automatically on each reset, so no task files are needed.
+
+- GuessTheNumber (random seeds each reset)
+  ```bash
+  python3 -m verl.trainer.main_ppo \
+    ... \
+    env.env_name=gem \
+    +env.gem.use_default_pool=False \
+    +env.gem.env_ids=["game:GuessTheNumber-v0-easy"]
+  ```
+
+- Minesweeper (random seeds each reset)
+  ```bash
+  python3 -m verl.trainer.main_ppo \
+    ... \
+    env.env_name=gem \
+    +env.gem.use_default_pool=False \
+    +env.gem.env_ids=["game:Minesweeper-v0-easy"]
+  ```
+
+Optional: fixed seeds for reproducibility without extra files
+```bash
+python3 -m verl.trainer.main_ppo \
+  ... \
+  env.env_name=gem \
+  +env.gem.use_default_pool=False \
+  +env.gem.env_ids=["game:GuessTheNumber-v0-easy"] \
+  +env.gem.task_pool_train=[{env_id:"game:GuessTheNumber-v0-easy",seed:1},{env_id:"game:GuessTheNumber-v0-easy",seed:2}]
+```
+
 #### Troubleshooting (common environment issues)
 
 ##### 1) OmegaConf import error: `Could not deserialize ATN with version 3 (expected 4)`
