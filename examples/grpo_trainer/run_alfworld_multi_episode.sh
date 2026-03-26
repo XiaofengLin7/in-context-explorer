@@ -1,18 +1,18 @@
 set -x
-export ALFWORLD_DATA=/projectnb/replearn/xfl/alfworld/data_storage
-N_GPUS=4
+# export ALFWORLD_DATA=/projectnb/replearn/xfl/alfworld/data_storage
+N_GPUS=2
 ENGINE=${1:-vllm}
 export VLLM_ATTENTION_BACKEND=FLASH_ATTN
 
 num_cpus_per_env_worker=0.1 # The CPU resource allocated for each environment worker. If you want to use less CPU resources, you can decrease this value.
-
+model_path=Qwen/Qwen3-8B
 train_data_size=16
 val_data_size=128
 group_size=8
-prompt_type=vanilla
+prompt_type=chat
 history_length=30
 env_max_steps=10
-experiment_name=grpo_qwen2.5_1.5b_prompt_type_${prompt_type}_history_length_${history_length}_env_max_steps_${env_max_steps}
+experiment_name=grpo_${model_path}_prompt_type_${prompt_type}_history_length_${history_length}_env_max_steps_${env_max_steps}
 
 # We only use data preparation to indicate the modality and the data size.
 python3 -m examples.data_preprocess.prepare \
@@ -26,12 +26,12 @@ python3 -m verl.trainer.main_ppo \
     data.val_files=$HOME/data/verl-agent/text/test.parquet \
     data.train_batch_size=$train_data_size \
     data.val_batch_size=$val_data_size \
-    data.max_prompt_length=4096 \
-    data.max_response_length=512 \
+    data.max_prompt_length=28670 \
+    data.max_response_length=4096 \
     data.filter_overlong_prompts=True \
-    data.truncation='error' \
+    data.truncation='left' \
     data.return_raw_chat=True \
-    actor_rollout_ref.model.path=Qwen/Qwen2.5-1.5B-Instruct \
+    actor_rollout_ref.model.path="${model_path}" \
     actor_rollout_ref.actor.optim.lr=1e-6 \
     actor_rollout_ref.model.use_remove_padding=True \
     actor_rollout_ref.actor.ppo_mini_batch_size=128 \
@@ -66,6 +66,7 @@ python3 -m verl.trainer.main_ppo \
     env.multi_episode_rollout.enable=True \
     env.multi_episode_rollout.reward_per_completion=1.0 \
     env.multi_episode_rollout.episode_max_steps=$env_max_steps \
+    +env.verbose_rollout=True \
     trainer.critic_warmup=0 \
     trainer.logger=['console','wandb'] \
     trainer.project_name='verl_agent_alfworld' \
