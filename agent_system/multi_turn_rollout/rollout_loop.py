@@ -420,9 +420,7 @@ class TrajectoryCollector:
             
             text_actions = self.tokenizer.batch_decode(batch.batch['responses'], skip_special_tokens=True)
             next_obs, rewards, dones, infos = envs.step(text_actions)
-            # breakpoint()
-            ## verbose to check the first element of next_obs
-            # print(next_obs['text'][0])
+
 
             
             if len(rewards.shape) == 2:
@@ -550,6 +548,28 @@ class TrajectoryCollector:
             for idx in range(batch_size):
                 if total_infos[idx]:
                     total_infos[idx][-1]['won'] = float(success_counts[idx] > 0)
+
+        # Verbose rollout logging: print final trajectory for env 0.
+        # Enable with env.verbose_rollout=True in config.
+        if getattr(self.config.env, 'verbose_rollout', False):
+            print(f"\n{'='*60}")
+            print(f"[Final Rollout] env=0, steps={_step+1}")
+            print(f"{'='*60}")
+            obs_text_0 = obs.get('text', [None])[0] if obs.get('text') else None
+            if isinstance(obs_text_0, list):
+                # Chat-style: print the full conversation history
+                for msg in obs_text_0:
+                    role = msg.get('role', '?')
+                    content = msg.get('content', [])
+                    if isinstance(content, list):
+                        text = ''.join(b.get('text', '') for b in content if b.get('type') == 'text')
+                    else:
+                        text = str(content)
+                    print(f"  [{role}] {text}")
+            elif obs_text_0 is not None:
+                print(f"  [prompt] {obs_text_0}")
+            print(f"  [last response] {text_actions[0]}")
+            print(f"{'='*60}\n")
 
         success: Dict[str, np.ndarray] = envs.success_evaluator(
                     total_infos=total_infos,
