@@ -93,6 +93,10 @@ def select_prompt_variant(
             # Fall back to vanilla variant if gold templates are not provided.
             return vanilla_init, vanilla_history, False
         return gold_init, gold_history, False
+    if prompt_type == 'chat':
+        # Chat mode is handled separately by AlfWorldEnvironmentManager;
+        # fall back to vanilla for other envs that call this function.
+        return vanilla_init, vanilla_history, False
     raise ValueError(f"Invalid prompt type: {config.env.prompt_type}")
 
 def parse_gamefile(infos):
@@ -205,7 +209,12 @@ class SearchEnvironmentManager(EnvironmentManagerBase):
 
 class AlfWorldEnvironmentManager(EnvironmentManagerBase):
     def __init__(self, envs, projection_f, config):
-        self.memory = SimpleMemory()
+        prompt_type = getattr(config.env, 'prompt_type', 'vanilla')
+        if prompt_type == 'chat':
+            from agent_system.memory import AlfWorldChatMemory
+            self.memory = AlfWorldChatMemory()
+        else:
+            self.memory = SimpleMemory()
         multi_episode_cfg = getattr(config.env, "multi_episode_rollout", None)
         self.multi_episode_enabled = bool(getattr(multi_episode_cfg, "enable", False)) if multi_episode_cfg else False
         self.episode_max_steps = getattr(multi_episode_cfg, "episode_max_steps", None) if multi_episode_cfg else None
@@ -228,7 +237,9 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
         self.receptacles = self.extract_receptacles(self.envs.get_admissible_commands)
         # Initialize unvisited_receptacles as a copy of all receptacles
         self.unvisited_receptacles = [receptacle_set.copy() for receptacle_set in self.receptacles]
-        if self.config.env.prompt_type == 'gold':
+        if self.config.env.prompt_type == 'chat':
+            full_text_obs = self._build_chat_obs(text_obs, self.envs.get_admissible_commands, init=True)
+        elif self.config.env.prompt_type == 'gold':
             full_text_obs = self.build_text_obs_gold(text_obs, self.envs.get_admissible_commands, init=True)
         elif self.config.env.prompt_type == 'summary':
             full_text_obs = self.build_text_obs_with_known_and_unknown(text_obs, self.envs.get_admissible_commands, [], [],init=True)
@@ -282,7 +293,28 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
                 self.episode_labels[idx] = ""
                 self.prev_episode_labels[idx] = ""
 
-        if self.config.env.prompt_type == 'gold':
+        if self.config.env.prompt_type == 'chat':
+            # Store new episode init observation for each reset env
+            for idx in env_indices:
+                reformatted = "\n ".join(
+                    f"'{s}'" for s in self.envs.get_admissible_commands[idx] if s != 'help'
+                )
+                user_text = ALFWORLD_CHAT_USER_OBS.format(
+                    current_observation=self.pre_text_obs[idx],
+                    admissible_actions=reformatted,
+                )
+                self.memory.store_single(idx, {
+                    'user_text': user_text,
+                    'assistant_text': None,
+                    'raw_obs': self.pre_text_obs[idx],
+                    'admissible_actions': reformatted,
+                    'episode_id': self.episode_ids[idx],
+                    'episode_step': self.episode_step_ids[idx],
+                    'episode_label': self.episode_labels[idx],
+                })
+            system_prompts = self._build_chat_system_prompts(len(self.pre_text_obs))
+            full_text_obs = self.memory.build_message_history(system_prompts)
+        elif self.config.env.prompt_type == 'gold':
             full_text_obs = self.build_text_obs_gold(self.pre_text_obs, self.envs.get_admissible_commands)
         elif self.config.env.prompt_type == 'summary':
             empty_known = [""] * len(self.pre_text_obs)
@@ -308,20 +340,31 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
         # extract known and unkown here as text_actions will be mutated in place in  self.projection_f
         if self.config.env.prompt_type == 'summary':
             known_information, unknown_information = extract_known_and_unknown(text_actions)
+        # Save raw model responses before projection mutates text_actions in place
+        if self.config.env.prompt_type == 'chat':
+            raw_responses = list(text_actions)
         actions, valids = self.projection_f(text_actions, self.envs.get_admissible_commands)
         text_obs, image_obs, rewards, dones, infos = self.envs.step(actions)
         for idx in range(len(actions)):
             self.episode_step_ids[idx] += 1
-        self.memory.store({
-            'text_obs': self.pre_text_obs,
-            'action': actions,
-            'episode_id': list(self.episode_ids),
-            'episode_step': list(self.episode_step_ids),
-            'episode_label': list(self.episode_labels),
-        })
+
+        if self.config.env.prompt_type == 'chat':
+            self._store_chat_record(text_obs, raw_responses)
+            full_text_obs = self._build_chat_obs(text_obs, self.envs.get_admissible_commands)
+        else:
+            self.memory.store({
+                'text_obs': self.pre_text_obs,
+                'action': actions,
+                'episode_id': list(self.episode_ids),
+                'episode_step': list(self.episode_step_ids),
+                'episode_label': list(self.episode_labels),
+            })
+
         self.pre_text_obs = text_obs
         self.update_receptacles(text_obs, actions)
-        if self.config.env.prompt_type == 'summary':
+        if self.config.env.prompt_type == 'chat':
+            pass  # already built above
+        elif self.config.env.prompt_type == 'summary':
             full_text_obs = self.build_text_obs_with_known_and_unknown(text_obs, self.envs.get_admissible_commands, known_information, unknown_information)
         elif self.config.env.prompt_type == 'gold':
             full_text_obs = self.build_text_obs_gold(text_obs, self.envs.get_admissible_commands)
@@ -582,6 +625,79 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
             prompt = f"{message}\n\n{prompt}"
             self.episode_start_messages[idx] = ""
         return prompt
+
+    # ---- Chat (ORBIT-style multi-turn) helpers ---- #
+
+    def _build_chat_system_prompts(self, batch_size: int) -> List[str]:
+        if self.multi_episode_enabled:
+            episode_cap = int(self.episode_max_steps or self.config.env.max_steps)
+            return [ALFWORLD_CHAT_SYSTEM_PROMPT.format(episode_cap=episode_cap)] * batch_size
+        return [ALFWORLD_CHAT_SYSTEM_PROMPT_SINGLE] * batch_size
+
+    def _format_admissible_actions(self, admissible_commands: List[str]) -> str:
+        return "\n ".join(f"'{s}'" for s in admissible_commands if s != 'help')
+
+    def _build_chat_obs(
+        self,
+        text_obs: List[str],
+        admissible_commands: List[List[str]],
+        init: bool = False,
+        raw_responses: List[str] = None,
+    ) -> List[List[Dict]]:
+        """Build chat message lists for all environments.
+
+        On init: stores initial record (assistant_text=None) and builds messages.
+        On step: assumes _store_chat_record was already called.
+        """
+        if init:
+            user_texts = []
+            raw_obs_list = []
+            admissible_strs = []
+            for i in range(len(text_obs)):
+                reformatted = self._format_admissible_actions(admissible_commands[i])
+                user_text = ALFWORLD_CHAT_USER_OBS.format(
+                    current_observation=text_obs[i],
+                    admissible_actions=reformatted,
+                )
+                user_texts.append(user_text)
+                raw_obs_list.append(text_obs[i])
+                admissible_strs.append(reformatted)
+
+            self.memory.store({
+                'user_text': user_texts,
+                'assistant_text': [None] * len(text_obs),
+                'raw_obs': raw_obs_list,
+                'admissible_actions': admissible_strs,
+                'episode_id': list(self.episode_ids),
+                'episode_step': list(self.episode_step_ids),
+                'episode_label': list(self.episode_labels),
+            })
+
+        system_prompts = self._build_chat_system_prompts(len(text_obs))
+        return self.memory.build_message_history(system_prompts)
+
+    def _store_chat_record(self, text_obs: List[str], raw_responses: List[str]):
+        """Store a chat record pairing raw model responses with new observations."""
+        user_texts = []
+        admissible_strs = []
+        for i in range(len(text_obs)):
+            reformatted = self._format_admissible_actions(self.envs.get_admissible_commands[i])
+            user_text = ALFWORLD_CHAT_USER_OBS.format(
+                current_observation=text_obs[i],
+                admissible_actions=reformatted,
+            )
+            user_texts.append(user_text)
+            admissible_strs.append(reformatted)
+
+        self.memory.store({
+            'user_text': user_texts,
+            'assistant_text': raw_responses,
+            'raw_obs': list(text_obs),
+            'admissible_actions': admissible_strs,
+            'episode_id': list(self.episode_ids),
+            'episode_step': list(self.episode_step_ids),
+            'episode_label': list(self.episode_labels),
+        })
 
     def _process_batch(self, batch_idx, total_batch_list, total_infos, success):
         # Find the last entry with active masks
