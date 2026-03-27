@@ -1,17 +1,17 @@
 set -x
-export ALFWORLD_DATA=/projectnb/replearn/xfl/alfworld/data_storage
-N_GPUS=2
 ENGINE=${1:-vllm}
 export VLLM_ATTENTION_BACKEND=FLASH_ATTN
+export HYDRA_FULL_ERROR=1
 
 num_cpus_per_env_worker=0.1 # The CPU resource allocated for each environment worker. If you want to use less CPU resources, you can decrease this value.
 model_path=Qwen/Qwen3-8B
+N_GPUS=4
 train_data_size=16
 val_data_size=128
 group_size=8
 prompt_type=chat
 history_length=30
-env_max_steps=10
+env_max_steps=15
 experiment_name=grpo_${model_path}_prompt_type_${prompt_type}_history_length_${history_length}_env_max_steps_${env_max_steps}
 
 # We only use data preparation to indicate the modality and the data size.
@@ -56,7 +56,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.use_invalid_action_penalty=True \
     actor_rollout_ref.actor.invalid_action_penalty_coef=0.1 \
     algorithm.use_kl_in_reward=False \
-    env.env_name=alfworld/AlfredTWEnv \
+    env.env_name=Webshop \
     env.seed=0 \
     env.prompt_type=$prompt_type \
     env.max_steps=30 \
@@ -66,11 +66,11 @@ python3 -m verl.trainer.main_ppo \
     env.multi_episode_rollout.enable=True \
     env.multi_episode_rollout.reward_per_completion=1.0 \
     env.multi_episode_rollout.episode_max_steps=$env_max_steps \
-    +env.multi_episode_rollout.enable_reflection=${ENABLE_REFLECTION:-False} \
+    env.multi_episode_rollout.enable_reflection=${ENABLE_REFLECTION:-False} \
     +env.verbose_rollout=True \
     trainer.critic_warmup=0 \
     trainer.logger=['console','wandb'] \
-    trainer.project_name='verl_agent_alfworld' \
+    trainer.project_name='verl_agent_webshop' \
     trainer.experiment_name=$experiment_name \
     trainer.n_gpus_per_node=$N_GPUS \
     trainer.nnodes=1 \

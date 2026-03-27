@@ -24,6 +24,7 @@ import uuid
 from verl.models.transformers.qwen2_vl import get_rope_index
 from agent_system.multi_turn_rollout.utils import process_image, to_list_of_dict, torch_to_numpy, filter_group_data
 from agent_system.environments import EnvironmentManagerBase
+from agent_system.environments.env_manager import extract_task_type
 from typing import List, Dict
 from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
 from PIL import Image
@@ -363,6 +364,11 @@ class TrajectoryCollector:
                 (max_episode_slots, batch_size), np.nan, dtype=np.float32
             )
 
+        # Reflection state (ORBIT-style: reflect at episode boundary before soft_reset)
+        enable_reflection = bool(getattr(multi_episode_cfg, "enable_reflection", False)) if multi_episode_cfg else False
+        awaiting_reflection = np.zeros(batch_size, dtype=bool)
+        reflection_prev_infos: list[dict | None] = [None] * batch_size
+
         # Initial observations from the environment
         obs, infos = envs.reset(kwargs=gen_batch.non_tensor_batch.pop('env_kwargs', None))
 
@@ -429,6 +435,41 @@ class TrajectoryCollector:
                 # dones is numpy, delete a dimension
                 dones = dones.squeeze(1)
 
+            # --- Consume pending reflections (before reward tracking) ---
+            reflection_consuming: list[int] = []
+            if enable_reflection and awaiting_reflection.any():
+                for idx in range(batch_size):
+                    if awaiting_reflection[idx] and active_masks[idx]:
+                        reflection_consuming.append(idx)
+            if reflection_consuming:
+                # Override rewards/dones for reflection envs
+                rewards_np = torch_to_numpy(rewards) if not isinstance(rewards, np.ndarray) else rewards
+                for idx in reflection_consuming:
+                    rewards_np[idx] = 0.0
+                    dones[idx] = False
+                rewards = rewards_np
+
+                prev_infos_for_reflection = [reflection_prev_infos[idx] for idx in reflection_consuming]
+                obs_updates, info_updates = envs.consume_reflection(
+                    reflection_consuming, text_actions, prev_infos_for_reflection)
+
+                for field in ("text", "image", "anchor"):
+                    if field not in obs_updates or obs_updates[field] == {}:
+                        continue
+                    if next_obs.get(field) is None:
+                        continue
+                    for idx, value in obs_updates[field].items():
+                        next_obs[field][idx] = value
+
+                for idx in reflection_consuming:
+                    if idx in info_updates:
+                        infos[idx] = info_updates[idx]
+                    infos[idx]['is_action_valid'] = True  # reflection step is always valid
+                    awaiting_reflection[idx] = False
+                    reflection_prev_infos[idx] = None
+                    if episode_step_counts is not None:
+                        episode_step_counts[idx] = 0
+
             if 'is_action_valid' in infos[0]:
                 batch.non_tensor_batch['is_action_valid'] = np.array([info['is_action_valid'] for info in infos], dtype=bool)
             else:
@@ -442,14 +483,22 @@ class TrajectoryCollector:
             episode_lengths[active_masks] += 1
             total_step_counts[active_masks] += 1
             if multi_episode_enabled and episode_step_counts is not None:
-                episode_step_counts[active_masks] += 1
+                step_mask = active_masks.copy()
+                if enable_reflection:
+                    step_mask = step_mask & ~awaiting_reflection
+                episode_step_counts[step_mask] += 1
 
             reset_idx_set: set[int] = set()
+            if reflection_consuming:
+                reset_idx_set.update(reflection_consuming)
             soft_reset_indices: list[int] = []
             if multi_episode_enabled and episode_step_counts is not None:
                 episode_completions: list[tuple[int, str]] = []
                 for idx in range(batch_size):
                     if not active_masks[idx]:
+                        continue
+                    # Skip envs awaiting reflection — they are mid-reflection
+                    if enable_reflection and awaiting_reflection[idx]:
                         continue
                     # If we've already collected the full trajectory budget for this env, do not soft-reset.
                     # We want to end cleanly at env.max_steps.
@@ -467,11 +516,13 @@ class TrajectoryCollector:
                     # This keeps the trajectory length consistent and lets the policy learn from failures.
                     elif "gem" in self.config.env.env_name.lower() and dones[idx]:
                         episode_completions.append((idx, "terminal"))
+                    elif "webshop" in self.config.env.env_name.lower() and dones[idx]:
+                        episode_completions.append((idx, "terminal"))
                     elif episode_step_counts[idx] >= episode_max_steps:
                         episode_completions.append((idx, "step_limit"))
 
                 for idx, reason in episode_completions:
-                    soft_reset_indices.append(idx)
+                    # Record per-episode metrics
                     if per_episode_success_flags is not None and per_episode_lengths is not None:
                         slot = int(current_episode_ids[idx])
                         if slot < max_episode_slots:
@@ -482,12 +533,23 @@ class TrajectoryCollector:
                     infos[idx]["multi_episode_episode_step_count"] = int(episode_step_counts[idx])
                     infos[idx]["multi_episode_episode_success"] = float(reason == "success")
 
+                    # Decide: trigger reflection or immediate soft_reset
+                    has_reflection_budget = int(total_step_counts[idx]) + 2 <= int(max_total_steps)
+                    if enable_reflection and has_reflection_budget:
+                        awaiting_reflection[idx] = True
+                        reflection_prev_infos[idx] = dict(infos[idx])
+                        envs.build_reflection_obs([idx], next_obs, infos)
+                        dones[idx] = False
+                        reset_idx_set.add(idx)
+                    else:
+                        soft_reset_indices.append(idx)
+
                 if soft_reset_indices:
                     try:
                         obs_updates, info_updates = envs.soft_reset(soft_reset_indices, infos)
                     except NotImplementedError as exc:
                         raise RuntimeError("Multi-episode rollout requires environment soft_reset support.") from exc
-                    reset_idx_set = set(soft_reset_indices)
+                    reset_idx_set.update(soft_reset_indices)
 
                     for field in ("text", "image", "anchor"):
                         if field not in obs_updates or obs_updates[field] == {}:
@@ -586,6 +648,23 @@ class TrajectoryCollector:
                 for slot in range(max_episode_slots):
                     success[f"episode_{slot + 1}/success_rate"] = per_episode_success_flags[slot].copy()
                     success[f"episode_{slot + 1}/length"] = per_episode_lengths[slot].copy()
+
+                # Per-episode per-task-type metrics (ALFWorld)
+                gamefiles = getattr(envs, 'gamefile', None)
+                if gamefiles:
+                    task_types = [extract_task_type(gf) for gf in gamefiles]
+                    unique_types = set(t for t in task_types if t is not None)
+                    type_masks = {
+                        t: np.array([tt == t for tt in task_types])
+                        for t in unique_types
+                    }
+                    for task_type in unique_types:
+                        mask = type_masks[task_type]
+                        for slot in range(max_episode_slots):
+                            vals = per_episode_success_flags[slot].copy()
+                            vals[~mask] = np.nan
+                            if not np.isnan(vals).all():
+                                success[f"episode_{slot + 1}/{task_type}_success_rate"] = vals
         else:
             # Apply ALFWorld/WebShop-specific trajectory reward shaping if applicable:
             # desired: episode_reward = -T + 30 * I_success

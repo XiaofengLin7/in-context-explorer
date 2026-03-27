@@ -479,15 +479,23 @@ class WebVoyagerMemory(BaseMemory):
 
 class AlfWorldChatMemory(BaseMemory):
     """
-    Memory manager for ALFWorld chat (ORBIT-style multi-turn) prompting.
+    Memory manager for chat (ORBIT-style multi-turn) prompting.
 
     Stores per-environment history records including raw model responses
     (assistant text) and builds proper multi-turn chat message lists.
     Historical user messages have admissible actions stripped; only the
     current step's user message includes them.
+
+    Args:
+        stripped_template: Format string for historical user messages.
+            Must accept ``current_observation`` as a format key.
+            Defaults to ``ALFWORLD_CHAT_USER_OBS_STRIPPED``.
     """
 
-    def __init__(self):
+    def __init__(self, stripped_template=None):
+        if stripped_template is None:
+            stripped_template = ALFWORLD_CHAT_USER_OBS_STRIPPED
+        self.stripped_template = stripped_template
         self._data: Optional[List[List[Dict[str, Any]]]] = None
         self.keys: Optional[List[str]] = None
         self.batch_size: int = 0
@@ -612,8 +620,12 @@ class AlfWorldChatMemory(BaseMemory):
                 is_last = i == len(records) - 1
                 if is_last:
                     user_text = prefix + rec["user_text"]
+                elif rec.get("is_reflection"):
+                    raw_obs = rec.get("raw_obs", "")
+                    stripped = f"[Reflection requested after observing: {raw_obs[:100]}]"
+                    user_text = prefix + stripped
                 else:
-                    stripped = ALFWORLD_CHAT_USER_OBS_STRIPPED.format(
+                    stripped = self.stripped_template.format(
                         current_observation=rec["raw_obs"]
                     )
                     user_text = prefix + stripped
