@@ -16,6 +16,7 @@
 from typing import List, Dict, Any, Tuple, Optional
 import re
 from .base import BaseMemory
+from agent_system.environments.prompts.alfworld import ALFWORLD_CHAT_USER_OBS_STRIPPED
 
 class SimpleMemory(BaseMemory):
     """
@@ -474,6 +475,171 @@ class WebVoyagerMemory(BaseMemory):
                     k += 1
 
         return messages
+
+
+class AlfWorldChatMemory(BaseMemory):
+    """
+    Memory manager for chat (ORBIT-style multi-turn) prompting.
+
+    Stores per-environment history records including raw model responses
+    (assistant text) and builds proper multi-turn chat message lists.
+    Historical user messages have admissible actions stripped; only the
+    current step's user message includes them.
+
+    Args:
+        stripped_template: Format string for historical user messages.
+            Must accept ``current_observation`` as a format key.
+            Defaults to ``ALFWORLD_CHAT_USER_OBS_STRIPPED``.
+    """
+
+    def __init__(self, stripped_template=None):
+        if stripped_template is None:
+            stripped_template = ALFWORLD_CHAT_USER_OBS_STRIPPED
+        self.stripped_template = stripped_template
+        self._data: Optional[List[List[Dict[str, Any]]]] = None
+        self.keys: Optional[List[str]] = None
+        self.batch_size: int = 0
+
+    def __len__(self):
+        return len(self._data)
+
+    def __getitem__(self, idx: int):
+        return self._data[idx]
+
+    def reset(self, batch_size: int):
+        if self._data is not None:
+            self._data.clear()
+        self._data = [[] for _ in range(batch_size)]
+        self.batch_size = batch_size
+        self.keys = None
+
+    def store(self, record: Dict[str, List[Any]]):
+        """Store a batch record (one per environment).
+
+        Expected keys: user_text, assistant_text, raw_obs,
+        admissible_actions, episode_id, episode_step, episode_label.
+        """
+        if self.keys is None:
+            self.keys = list(record.keys())
+        assert self.keys == list(record.keys())
+
+        for env_idx in range(self.batch_size):
+            self._data[env_idx].append(
+                {k: record[k][env_idx] for k in self.keys}
+            )
+
+    def store_single(self, env_idx: int, record: Dict[str, Any]):
+        """Store a record for a single environment (used by soft_reset)."""
+        self._data[env_idx].append(record)
+
+    def fetch(
+        self,
+        history_length: int,
+        obs_key: str = "raw_obs",
+        action_key: str = "assistant_text",
+        **kwargs,
+    ) -> Tuple[List[str], List[int]]:
+        """Backward-compatible fetch returning formatted history strings."""
+        memory_contexts, valid_lengths = [], []
+        for env_idx in range(self.batch_size):
+            recent = self._data[env_idx][-history_length:]
+            valid_len = len(recent)
+            start_idx = len(self._data[env_idx]) - valid_len
+            lines = []
+            for j, rec in enumerate(recent):
+                step_num = start_idx + j + 1
+                obs = rec.get(obs_key, "")
+                act = rec.get(action_key, "") or ""
+                lines.append(
+                    f"[Observation {step_num}: '{obs}', Action {step_num}: '{act}']"
+                )
+            memory_contexts.append("\n".join(lines))
+            valid_lengths.append(valid_len)
+        return memory_contexts, valid_lengths
+
+    def build_message_history(
+        self, system_prompts: List[str]
+    ) -> List[List[Dict[str, Any]]]:
+        """Build multi-turn chat message lists for each environment.
+
+        Returns:
+            List of message lists, one per environment. Each message is:
+            {"role": "system"|"user"|"assistant",
+             "content": [{"type": "text", "text": "..."}]}
+        """
+        all_env_histories: List[List[Dict[str, Any]]] = []
+
+        for env_idx in range(self.batch_size):
+            messages: List[Dict[str, Any]] = [
+                {
+                    "role": "system",
+                    "content": [
+                        {"type": "text", "text": system_prompts[env_idx]}
+                    ],
+                }
+            ]
+
+            records = self._data[env_idx]
+            prev_episode_id: Optional[int] = None
+
+            for i, rec in enumerate(records):
+                # Emit assistant message if present
+                assistant_text = rec.get("assistant_text")
+                if assistant_text is not None:
+                    messages.append(
+                        {
+                            "role": "assistant",
+                            "content": [
+                                {"type": "text", "text": assistant_text}
+                            ],
+                        }
+                    )
+
+                # Determine episode boundary
+                episode_id = rec.get("episode_id", 0)
+                prefix = ""
+                if prev_episode_id is not None and episode_id != prev_episode_id:
+                    prev_label = ""
+                    if i > 0:
+                        prev_label = (
+                            records[i - 1].get("episode_label", "") or ""
+                        ).strip()
+                    episode_num = int(episode_id) + 1
+                    if prev_label:
+                        prefix = (
+                            f"[Episode {episode_num}] New episode begins.\n"
+                            f"Previous episode result: {prev_label}\n\n"
+                        )
+                    else:
+                        prefix = (
+                            f"[Episode {episode_num}] New episode begins.\n\n"
+                        )
+                prev_episode_id = episode_id
+
+                # Build user message: full for current step, stripped for history
+                is_last = i == len(records) - 1
+                if is_last:
+                    user_text = prefix + rec["user_text"]
+                elif rec.get("is_reflection"):
+                    raw_obs = rec.get("raw_obs", "")
+                    stripped = f"[Reflection requested after observing: {raw_obs[:100]}]"
+                    user_text = prefix + stripped
+                else:
+                    stripped = self.stripped_template.format(
+                        current_observation=rec["raw_obs"]
+                    )
+                    user_text = prefix + stripped
+
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": [{"type": "text", "text": user_text}],
+                    }
+                )
+
+            all_env_histories.append(messages)
+
+        return all_env_histories
 
 
 class SearchMemory(BaseMemory):

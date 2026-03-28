@@ -102,6 +102,27 @@ You are currently in episode {current_episode} and you are at step {current_step
 Your admissible actions of the current situation are: [{admissible_actions}].
 
 Now it's your turn to take an action.
-You should first reason step-by-step about the current situation. This reasoning process MUST be enclosed within <think> </think> tags. 
+You should first reason step-by-step about the current situation. This reasoning process MUST be enclosed within <think> </think> tags.
 Once you've finished your reasoning, you should choose an admissible action for current step and present it within <action> </action> tags.
 """
+
+# --------------------- ALFWorld Chat (ORBIT-style multi-turn) --------------------- #
+ALFWORLD_CHAT_SYSTEM_PROMPT = """You are an expert agent operating in the ALFRED Embodied Environment. Every episode resets on: success or after {episode_cap} step(s). The task is unchanged across episodes, so you can reuse what you learned from previous episodes.
+
+You should first reason step-by-step about the current situation. This reasoning process MUST be enclosed within <think> </think> tags.
+Once you've finished your reasoning, you should choose an admissible action for the current step and present it within <action> </action> tags."""
+
+ALFWORLD_CHAT_SYSTEM_PROMPT_SINGLE = """You are an expert agent operating in the ALFRED Embodied Environment.
+
+You should first reason step-by-step about the current situation. This reasoning process MUST be enclosed within <think> </think> tags.
+Once you've finished your reasoning, you should choose an admissible action for the current step and present it within <action> </action> tags."""
+
+ALFWORLD_CHAT_USER_OBS = """Your current observation is: {current_observation}
+Your admissible actions of the current situation are: [{admissible_actions}]."""
+
+ALFWORLD_CHAT_USER_OBS_STRIPPED = """Your current observation was: {current_observation}"""
+
+ALFWORLD_CHAT_REFLECTION_PROMPT = """[Reflection] The episode has ended. Reflect on the past experience and come up with a new plan of action.
+- First, reason step-by-step about the strategy and path you took to attempt to complete the task. Identify where things went wrong or could be better.
+- Then devise a concise, new plan of action that accounts for your mistake with reference to specific actions that you should have taken.
+- Finally, end the response with your reflection and improved plan inside <remark> </remark> tags, to guide the next trial."""

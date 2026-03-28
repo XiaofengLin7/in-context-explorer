@@ -24,7 +24,9 @@ from agent_system.environments.base import EnvironmentManagerBase, to_numpy
 from agent_system.memory import SimpleMemory, SearchMemory, WebVoyagerMemory
 from omegaconf import OmegaConf
 import re
-from agent_system.environments.env_package.alfworld.alfworld.gen.constants import OPENABLE_CLASS_SET
+def _get_openable_class_set():
+    from agent_system.environments.env_package.alfworld.alfworld.gen.constants import OPENABLE_CLASS_SET
+    return OPENABLE_CLASS_SET
 
 def extract_known_and_unknown(responses: List[str]) -> Tuple[List[str], List[str]]:
     """
@@ -93,7 +95,29 @@ def select_prompt_variant(
             # Fall back to vanilla variant if gold templates are not provided.
             return vanilla_init, vanilla_history, False
         return gold_init, gold_history, False
+    if prompt_type == 'chat':
+        # Chat mode is handled separately by AlfWorldEnvironmentManager;
+        # fall back to vanilla for other envs that call this function.
+        return vanilla_init, vanilla_history, False
     raise ValueError(f"Invalid prompt type: {config.env.prompt_type}")
+
+ALFWORLD_TASK_TYPES = [
+    "pick_and_place",
+    "pick_two_obj_and_place",
+    "look_at_obj_in_light",
+    "pick_heat_then_place_in_recep",
+    "pick_cool_then_place_in_recep",
+    "pick_clean_then_place_in_recep",
+]
+
+def extract_task_type(gamefile: str) -> str | None:
+    """Extract ALFWorld task type from a gamefile string."""
+    if not gamefile:
+        return None
+    for task in ALFWORLD_TASK_TYPES:
+        if task in gamefile:
+            return task
+    return None
 
 def parse_gamefile(infos):
     gamefile = []
@@ -205,12 +229,18 @@ class SearchEnvironmentManager(EnvironmentManagerBase):
 
 class AlfWorldEnvironmentManager(EnvironmentManagerBase):
     def __init__(self, envs, projection_f, config):
-        self.memory = SimpleMemory()
+        prompt_type = getattr(config.env, 'prompt_type', 'vanilla')
+        if prompt_type == 'chat':
+            from agent_system.memory import AlfWorldChatMemory
+            self.memory = AlfWorldChatMemory()
+        else:
+            self.memory = SimpleMemory()
         multi_episode_cfg = getattr(config.env, "multi_episode_rollout", None)
         self.multi_episode_enabled = bool(getattr(multi_episode_cfg, "enable", False)) if multi_episode_cfg else False
         self.episode_max_steps = getattr(multi_episode_cfg, "episode_max_steps", None) if multi_episode_cfg else None
+        self.enable_reflection = bool(getattr(multi_episode_cfg, "enable_reflection", False)) if multi_episode_cfg else False
         super().__init__(envs, projection_f, config)
-    
+
     def reset(self, kwargs):
         text_obs, image_obs, infos = self.envs.reset()
         self.gamefile = parse_gamefile(infos)
@@ -221,6 +251,7 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
         self.episode_labels = [""] * len(text_obs)
         self.prev_episode_labels = [""] * len(text_obs)
         self.episode_step_ids = [0 for _ in range(len(text_obs))]
+        self._reflection_pending = [False] * len(text_obs)
         self.tasks = []
         self.visited_receptacles = [set() for _ in range(len(text_obs))]
         self.pre_text_obs = text_obs
@@ -228,7 +259,9 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
         self.receptacles = self.extract_receptacles(self.envs.get_admissible_commands)
         # Initialize unvisited_receptacles as a copy of all receptacles
         self.unvisited_receptacles = [receptacle_set.copy() for receptacle_set in self.receptacles]
-        if self.config.env.prompt_type == 'gold':
+        if self.config.env.prompt_type == 'chat':
+            full_text_obs = self._build_chat_obs(text_obs, self.envs.get_admissible_commands, init=True)
+        elif self.config.env.prompt_type == 'gold':
             full_text_obs = self.build_text_obs_gold(text_obs, self.envs.get_admissible_commands, init=True)
         elif self.config.env.prompt_type == 'summary':
             full_text_obs = self.build_text_obs_with_known_and_unknown(text_obs, self.envs.get_admissible_commands, [], [],init=True)
@@ -282,7 +315,28 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
                 self.episode_labels[idx] = ""
                 self.prev_episode_labels[idx] = ""
 
-        if self.config.env.prompt_type == 'gold':
+        if self.config.env.prompt_type == 'chat':
+            # Store new episode init observation for each reset env
+            for idx in env_indices:
+                reformatted = "\n ".join(
+                    f"'{s}'" for s in self.envs.get_admissible_commands[idx] if s != 'help'
+                )
+                user_text = ALFWORLD_CHAT_USER_OBS.format(
+                    current_observation=self.pre_text_obs[idx],
+                    admissible_actions=reformatted,
+                )
+                self.memory.store_single(idx, {
+                    'user_text': user_text,
+                    'assistant_text': None,
+                    'raw_obs': self.pre_text_obs[idx],
+                    'admissible_actions': reformatted,
+                    'episode_id': self.episode_ids[idx],
+                    'episode_step': self.episode_step_ids[idx],
+                    'episode_label': self.episode_labels[idx],
+                })
+            system_prompts = self._build_chat_system_prompts(len(self.pre_text_obs))
+            full_text_obs = self.memory.build_message_history(system_prompts)
+        elif self.config.env.prompt_type == 'gold':
             full_text_obs = self.build_text_obs_gold(self.pre_text_obs, self.envs.get_admissible_commands)
         elif self.config.env.prompt_type == 'summary':
             empty_known = [""] * len(self.pre_text_obs)
@@ -308,20 +362,37 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
         # extract known and unkown here as text_actions will be mutated in place in  self.projection_f
         if self.config.env.prompt_type == 'summary':
             known_information, unknown_information = extract_known_and_unknown(text_actions)
+        # Save raw model responses before projection mutates text_actions in place
+        if self.config.env.prompt_type == 'chat':
+            raw_responses = list(text_actions)
         actions, valids = self.projection_f(text_actions, self.envs.get_admissible_commands)
         text_obs, image_obs, rewards, dones, infos = self.envs.step(actions)
         for idx in range(len(actions)):
-            self.episode_step_ids[idx] += 1
-        self.memory.store({
-            'text_obs': self.pre_text_obs,
-            'action': actions,
-            'episode_id': list(self.episode_ids),
-            'episode_step': list(self.episode_step_ids),
-            'episode_label': list(self.episode_labels),
-        })
+            if not self._reflection_pending[idx]:
+                self.episode_step_ids[idx] += 1
+
+        if self.config.env.prompt_type == 'chat':
+            # Skip chat record storage for reflection-pending envs
+            # (their step results will be overridden by consume_reflection)
+            if any(self._reflection_pending):
+                self._store_chat_record_partial(text_obs, raw_responses)
+            else:
+                self._store_chat_record(text_obs, raw_responses)
+            full_text_obs = self._build_chat_obs(text_obs, self.envs.get_admissible_commands)
+        else:
+            self.memory.store({
+                'text_obs': self.pre_text_obs,
+                'action': actions,
+                'episode_id': list(self.episode_ids),
+                'episode_step': list(self.episode_step_ids),
+                'episode_label': list(self.episode_labels),
+            })
+
         self.pre_text_obs = text_obs
         self.update_receptacles(text_obs, actions)
-        if self.config.env.prompt_type == 'summary':
+        if self.config.env.prompt_type == 'chat':
+            pass  # already built above
+        elif self.config.env.prompt_type == 'summary':
             full_text_obs = self.build_text_obs_with_known_and_unknown(text_obs, self.envs.get_admissible_commands, known_information, unknown_information)
         elif self.config.env.prompt_type == 'gold':
             full_text_obs = self.build_text_obs_gold(text_obs, self.envs.get_admissible_commands)
@@ -360,7 +431,7 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
         return normalized
     
     def is_openable_receptacle(self, receptacle: str) -> bool:
-        for openable_receptacle in OPENABLE_CLASS_SET:
+        for openable_receptacle in _get_openable_class_set():
             if openable_receptacle.lower() in receptacle.lower():
                 return True
         return False
@@ -583,6 +654,155 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
             self.episode_start_messages[idx] = ""
         return prompt
 
+    # ---- Chat (ORBIT-style multi-turn) helpers ---- #
+
+    def _build_chat_system_prompts(self, batch_size: int) -> List[str]:
+        if self.multi_episode_enabled:
+            episode_cap = int(self.episode_max_steps or self.config.env.max_steps)
+            return [ALFWORLD_CHAT_SYSTEM_PROMPT.format(episode_cap=episode_cap)] * batch_size
+        return [ALFWORLD_CHAT_SYSTEM_PROMPT_SINGLE] * batch_size
+
+    def _format_admissible_actions(self, admissible_commands: List[str]) -> str:
+        return "\n ".join(f"'{s}'" for s in admissible_commands if s != 'help')
+
+    def _build_chat_obs(
+        self,
+        text_obs: List[str],
+        admissible_commands: List[List[str]],
+        init: bool = False,
+        raw_responses: List[str] = None,
+    ) -> List[List[Dict]]:
+        """Build chat message lists for all environments.
+
+        On init: stores initial record (assistant_text=None) and builds messages.
+        On step: assumes _store_chat_record was already called.
+        """
+        if init:
+            user_texts = []
+            raw_obs_list = []
+            admissible_strs = []
+            for i in range(len(text_obs)):
+                reformatted = self._format_admissible_actions(admissible_commands[i])
+                user_text = ALFWORLD_CHAT_USER_OBS.format(
+                    current_observation=text_obs[i],
+                    admissible_actions=reformatted,
+                )
+                user_texts.append(user_text)
+                raw_obs_list.append(text_obs[i])
+                admissible_strs.append(reformatted)
+
+            self.memory.store({
+                'user_text': user_texts,
+                'assistant_text': [None] * len(text_obs),
+                'raw_obs': raw_obs_list,
+                'admissible_actions': admissible_strs,
+                'episode_id': list(self.episode_ids),
+                'episode_step': list(self.episode_step_ids),
+                'episode_label': list(self.episode_labels),
+            })
+
+        system_prompts = self._build_chat_system_prompts(len(text_obs))
+        return self.memory.build_message_history(system_prompts)
+
+    def _store_chat_record(self, text_obs: List[str], raw_responses: List[str]):
+        """Store a chat record pairing raw model responses with new observations."""
+        user_texts = []
+        admissible_strs = []
+        for i in range(len(text_obs)):
+            reformatted = self._format_admissible_actions(self.envs.get_admissible_commands[i])
+            user_text = ALFWORLD_CHAT_USER_OBS.format(
+                current_observation=text_obs[i],
+                admissible_actions=reformatted,
+            )
+            user_texts.append(user_text)
+            admissible_strs.append(reformatted)
+
+        self.memory.store({
+            'user_text': user_texts,
+            'assistant_text': raw_responses,
+            'raw_obs': list(text_obs),
+            'admissible_actions': admissible_strs,
+            'episode_id': list(self.episode_ids),
+            'episode_step': list(self.episode_step_ids),
+            'episode_label': list(self.episode_labels),
+        })
+
+    def _store_chat_record_partial(self, text_obs: List[str], raw_responses: List[str]):
+        """Store chat records only for envs NOT in reflection-pending state."""
+        for i in range(len(text_obs)):
+            if self._reflection_pending[i]:
+                continue
+            reformatted = self._format_admissible_actions(self.envs.get_admissible_commands[i])
+            user_text = ALFWORLD_CHAT_USER_OBS.format(
+                current_observation=text_obs[i],
+                admissible_actions=reformatted,
+            )
+            self.memory.store_single(i, {
+                'user_text': user_text,
+                'assistant_text': raw_responses[i],
+                'raw_obs': text_obs[i],
+                'admissible_actions': reformatted,
+                'episode_id': self.episode_ids[i],
+                'episode_step': self.episode_step_ids[i],
+                'episode_label': self.episode_labels[i],
+            })
+
+    def build_reflection_obs(self, env_indices: List[int], next_obs: Dict, prev_infos: List[Dict]):
+        """Append reflection prompt to terminal observation for completed episodes.
+
+        Stores a reflection record in memory and rebuilds the message history
+        so the model sees the reflection prompt as the next user message.
+        """
+        for idx in env_indices:
+            self._reflection_pending[idx] = True
+            terminal_obs = self.pre_text_obs[idx]
+            episode_result = "succeeded" if prev_infos[idx].get("won", False) else "did not succeed"
+
+            user_text = (
+                f"Your current observation is: {terminal_obs}\n"
+                f"Episode result: {episode_result}.\n\n"
+                f"{ALFWORLD_CHAT_REFLECTION_PROMPT}"
+            )
+
+            self.memory.store_single(idx, {
+                'user_text': user_text,
+                'assistant_text': None,
+                'raw_obs': terminal_obs,
+                'admissible_actions': '',
+                'episode_id': self.episode_ids[idx],
+                'episode_step': self.episode_step_ids[idx],
+                'episode_label': '',
+                'is_reflection': True,
+            })
+
+        system_prompts = self._build_chat_system_prompts(len(self.pre_text_obs))
+        full_text_obs = self.memory.build_message_history(system_prompts)
+
+        for idx in env_indices:
+            next_obs["text"][idx] = full_text_obs[idx]
+
+    def consume_reflection(self, env_indices: List[int], text_actions: List[str], prev_infos: List[Dict]):
+        """Store reflection responses in memory and soft_reset to start new episodes.
+
+        Args:
+            env_indices: Which environments are completing reflection.
+            text_actions: The full text_actions list from the rollout step (indexed by env).
+            prev_infos: Per-index saved infos from when the episode originally completed.
+        """
+        for idx in env_indices:
+            last_rec = self.memory[idx][-1]
+            assert last_rec.get('is_reflection', False), \
+                f"Expected reflection record for env {idx}, got {last_rec.keys()}"
+            last_rec['assistant_text'] = text_actions[idx]
+            self._reflection_pending[idx] = False
+
+        # Build prev_infos list indexed by env_idx for soft_reset
+        infos_for_reset = [None] * len(self.pre_text_obs)
+        for idx, info in zip(env_indices, prev_infos):
+            infos_for_reset[idx] = info
+
+        return self.soft_reset(env_indices, infos_for_reset)
+
     def _process_batch(self, batch_idx, total_batch_list, total_infos, success):
         # Find the last entry with active masks
         for i in reversed(range(len(total_batch_list[batch_idx]))):
@@ -598,20 +818,9 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
                 return  # Exit after finding the first active mask
 
     def _process_gamefile(self, gamefile, won_value, success):
-        tasks = [
-            "pick_and_place",
-            "pick_two_obj_and_place",
-            "look_at_obj_in_light",
-            "pick_heat_then_place_in_recep",
-            "pick_cool_then_place_in_recep",
-            "pick_clean_then_place_in_recep",
-        ]
-        
-        for task in tasks:
-            key = f"{task}_success_rate"
-            if task in gamefile:
-                success.setdefault(key, []).append(won_value)
-                break
+        task = extract_task_type(gamefile)
+        if task:
+            success.setdefault(f"{task}_success_rate", []).append(won_value)
 
 
 class SokobanEnvironmentManager(EnvironmentManagerBase):
@@ -957,7 +1166,17 @@ class GemEnvironmentManager(EnvironmentManagerBase):
 
 class WebshopEnvironmentManager(EnvironmentManagerBase):
     def __init__(self, envs, projection_f, config):
-        self.memory = SimpleMemory()
+        prompt_type = getattr(config.env, 'prompt_type', 'vanilla')
+        if prompt_type == 'chat':
+            from agent_system.memory import AlfWorldChatMemory
+            self.memory = AlfWorldChatMemory(stripped_template=WEBSHOP_CHAT_USER_OBS_STRIPPED)
+        else:
+            self.memory = SimpleMemory()
+        # Multi-episode config
+        multi_episode_cfg = getattr(config.env, "multi_episode_rollout", None)
+        self.multi_episode_enabled = bool(getattr(multi_episode_cfg, "enable", False)) if multi_episode_cfg else False
+        self.episode_max_steps = getattr(multi_episode_cfg, "episode_max_steps", None) if multi_episode_cfg else None
+        self.enable_reflection = bool(getattr(multi_episode_cfg, "enable_reflection", False)) if multi_episode_cfg else False
         # Support summary/vanilla prompt variants like ALFWorld
         self.prompt_init, self.prompt_history, self.keep_known_and_unknown = select_prompt_variant(
             config,
@@ -967,38 +1186,70 @@ class WebshopEnvironmentManager(EnvironmentManagerBase):
             WEBSHOP_TEMPLATE_SUMMARY,
         )
         super().__init__(envs, projection_f, config)
-    
+
     def reset(self, kwargs) -> Dict[str, Any]:
         obs, infos = self.envs.reset()
         self.tasks = self.extract_task(obs)
         obs = self.format_obs(obs)
-        # infos = [None] * self.envs.num_envs
-        observations = {'text': self.build_text_obs(obs, infos, init=True), 
-                        'image': None, 
-                        'anchor': obs.copy()
-                        }
         self.pre_text_obs = obs
-        self.memory.reset(batch_size = len(infos))
+        self.current_infos = infos
+        self.memory.reset(batch_size=len(infos))
+        # Multi-episode tracking
+        self.episode_ids = [0] * len(obs)
+        self.episode_step_ids = [0] * len(obs)
+        self.episode_labels = [""] * len(obs)
+        self.prev_episode_labels = [""] * len(obs)
+        self._reflection_pending = [False] * len(obs)
+
+        if getattr(self.config.env, 'prompt_type', 'vanilla') == 'chat':
+            full_text_obs = self._build_chat_obs(obs, infos, init=True)
+        else:
+            full_text_obs = self.build_text_obs(obs, infos, init=True)
+
+        observations = {'text': full_text_obs, 'image': None, 'anchor': obs.copy()}
         return observations, infos
 
     def step(self, text_actions: List[str]):
         # extract known and unknown before projection if using summary prompts
         if self.keep_known_and_unknown:
             known_information, unknown_information = extract_known_and_unknown(text_actions)
+        # Save raw model responses before projection
+        prompt_type = getattr(self.config.env, 'prompt_type', 'vanilla')
+        if prompt_type == 'chat':
+            raw_responses = list(text_actions)
+
         actions, valids = self.projection_f(text_actions)
         next_obs, rewards, dones, infos = self.envs.step(actions)
-
         next_obs = self.format_obs(next_obs)
+        self.current_infos = infos
 
-        self.memory.store({'text_obs': self.pre_text_obs, 'action': actions})
-        self.pre_text_obs = next_obs
+        for idx in range(len(actions)):
+            if not self._reflection_pending[idx]:
+                self.episode_step_ids[idx] += 1
 
-        if self.keep_known_and_unknown:
-            text_field = self.build_text_obs_with_known_and_unknown(
-                next_obs, infos, known_information, unknown_information
-            )
+        if prompt_type == 'chat':
+            # Skip chat record storage for reflection-pending envs
+            if any(self._reflection_pending):
+                self._store_chat_record_partial(next_obs, infos, raw_responses)
+            else:
+                self._store_chat_record(next_obs, infos, raw_responses)
+            text_field = self._build_chat_obs(next_obs, infos)
         else:
-            text_field = self.build_text_obs(next_obs, infos)
+            self.memory.store({
+                'text_obs': self.pre_text_obs,
+                'action': actions,
+                'episode_id': list(self.episode_ids),
+                'episode_step': list(self.episode_step_ids),
+                'episode_label': list(self.episode_labels),
+            })
+            if self.keep_known_and_unknown:
+                text_field = self.build_text_obs_with_known_and_unknown(
+                    next_obs, infos, known_information, unknown_information
+                )
+            else:
+                text_field = self.build_text_obs(next_obs, infos)
+
+        self.pre_text_obs = next_obs
 
         next_observations = {
             'text': text_field,
@@ -1014,6 +1265,129 @@ class WebshopEnvironmentManager(EnvironmentManagerBase):
 
         return next_observations, rewards, dones, infos
 
+    def soft_reset(self, env_indices: List[int], prev_infos: List[Dict[str, Any]]):
+        if not env_indices:
+            return {}, {}
+
+        env_indices = [int(idx) for idx in env_indices]
+        obs_map, info_map = self.envs.soft_reset(env_indices)
+
+        for idx in env_indices:
+            # Format raw obs (strip task prefix)
+            raw_text = obs_map[idx]
+            parts = raw_text.split(" [SEP] ")
+            try:
+                task_index = parts.index(self.tasks[idx])
+                formatted = " [SEP] ".join(f"'{p}'" for p in parts[task_index + 1:])
+            except Exception:
+                formatted = raw_text
+            obs_map[idx] = formatted
+            self.pre_text_obs[idx] = formatted
+            self.current_infos[idx] = info_map[idx]
+
+            # Episode bookkeeping
+            last_episode_steps = self.episode_step_ids[idx]
+            if last_episode_steps == 0 and self.memory and len(self.memory[idx]) > 0:
+                last_episode_steps = int(self.memory[idx][-1].get("episode_step", 0))
+            reason = prev_infos[idx].get("multi_episode_soft_reset_reason", "success")
+            prev_episode = self.episode_ids[idx] + 1
+            self.episode_ids[idx] += 1
+            self.episode_step_ids[idx] = 0
+
+            if self.multi_episode_enabled:
+                episode_cap = int(self.episode_max_steps or self.config.env.max_steps)
+                if reason == "success":
+                    label = f"previous episode {prev_episode} succeeded in {last_episode_steps} step(s)"
+                else:
+                    label = (
+                        f"previous episode {prev_episode} reached {last_episode_steps}/{episode_cap} step(s) "
+                        f"without success"
+                    )
+                if self.memory and len(self.memory[idx]) > 0:
+                    self.memory[idx][-1]["episode_label"] = label
+                self.prev_episode_labels[idx] = label
+                self.episode_labels[idx] = ""
+            else:
+                self.episode_labels[idx] = ""
+                self.prev_episode_labels[idx] = ""
+
+        prompt_type = getattr(self.config.env, 'prompt_type', 'vanilla')
+        if prompt_type == 'chat':
+            for idx in env_indices:
+                available_actions = self.format_avail_actions(info_map[idx]['available_actions'])
+                reformatted = "\n".join(f"'{s}'," for s in available_actions)
+                user_text = WEBSHOP_CHAT_USER_OBS.format(
+                    task_description=self.tasks[idx],
+                    current_observation=self.pre_text_obs[idx],
+                    available_actions=reformatted,
+                )
+                self.memory.store_single(idx, {
+                    'user_text': user_text,
+                    'assistant_text': None,
+                    'raw_obs': self.pre_text_obs[idx],
+                    'admissible_actions': reformatted,
+                    'episode_id': self.episode_ids[idx],
+                    'episode_step': self.episode_step_ids[idx],
+                    'episode_label': self.episode_labels[idx],
+                })
+            system_prompts = self._build_chat_system_prompts(len(self.pre_text_obs))
+            full_text_obs = self.memory.build_message_history(system_prompts)
+        else:
+            full_text_obs = self.build_text_obs(self.pre_text_obs, self.current_infos)
+
+        obs_updates = {"text": {}, "image": {}, "anchor": {}}
+        for idx in env_indices:
+            obs_updates["text"][idx] = full_text_obs[idx]
+            obs_updates["anchor"][idx] = self.pre_text_obs[idx]
+            obs_updates["image"][idx] = None
+
+        return obs_updates, info_map
+
+    def build_reflection_obs(self, env_indices: List[int], next_obs: Dict, prev_infos: List[Dict]):
+        """Append reflection prompt to terminal observation for completed episodes."""
+        for idx in env_indices:
+            self._reflection_pending[idx] = True
+            terminal_obs = self.pre_text_obs[idx]
+            episode_result = "succeeded" if prev_infos[idx].get("won", False) else "did not succeed"
+
+            user_text = (
+                f"Your current observation is: {terminal_obs}\n"
+                f"Episode result: {episode_result}.\n\n"
+                f"{WEBSHOP_CHAT_REFLECTION_PROMPT}"
+            )
+
+            self.memory.store_single(idx, {
+                'user_text': user_text,
+                'assistant_text': None,
+                'raw_obs': terminal_obs,
+                'admissible_actions': '',
+                'episode_id': self.episode_ids[idx],
+                'episode_step': self.episode_step_ids[idx],
+                'episode_label': '',
+                'is_reflection': True,
+            })
+
+        system_prompts = self._build_chat_system_prompts(len(self.pre_text_obs))
+        full_text_obs = self.memory.build_message_history(system_prompts)
+
+        for idx in env_indices:
+            next_obs["text"][idx] = full_text_obs[idx]
+
+    def consume_reflection(self, env_indices: List[int], text_actions: List[str], prev_infos: List[Dict]):
+        """Store reflection responses in memory and soft_reset to start new episodes."""
+        for idx in env_indices:
+            last_rec = self.memory[idx][-1]
+            assert last_rec.get('is_reflection', False), \
+                f"Expected reflection record for env {idx}, got {last_rec.keys()}"
+            last_rec['assistant_text'] = text_actions[idx]
+            self._reflection_pending[idx] = False
+
+        infos_for_reset = [None] * len(self.pre_text_obs)
+        for idx, info in zip(env_indices, prev_infos):
+            infos_for_reset[idx] = info
+
+        return self.soft_reset(env_indices, infos_for_reset)
+
     def extract_task(self, text_obs: List[str]):
         tasks = []
         for obs in text_obs:
@@ -1021,7 +1395,7 @@ class WebshopEnvironmentManager(EnvironmentManagerBase):
             assert parts[1]=='Instruction:'
             tasks.append(parts[2])
         return tasks
-    
+
     def format_obs(self, text_obs):
         postprocess_text_obs = []
         for i in range(len(text_obs)):
@@ -1036,7 +1410,16 @@ class WebshopEnvironmentManager(EnvironmentManagerBase):
             postprocess_text_obs.append(reformatted_obs)
 
         return postprocess_text_obs
-    
+
+    def format_obs_single(self, raw_text: str, task: str) -> str:
+        """Format a single raw observation (used by soft_reset)."""
+        parts = raw_text.split(" [SEP] ")
+        try:
+            index = parts.index(task)
+            return " [SEP] ".join(f"'{p}'" for p in parts[index + 1:])
+        except Exception:
+            return raw_text
+
     def format_avail_actions(self, avail):
         actions = []
 
@@ -1051,7 +1434,7 @@ class WebshopEnvironmentManager(EnvironmentManagerBase):
             actions.append(f"click[{txt}]")
 
         return actions
-            
+
     def build_text_obs(self, text_obs: List[str], infos: List[List[str]], init: bool = False) -> List[str]:
         """
         This function builds the text observation for the agent.
@@ -1065,35 +1448,74 @@ class WebshopEnvironmentManager(EnvironmentManagerBase):
                     action_key="action",
                     episode_key="episode_id" if self.multi_episode_enabled else None,
                     episode_step_key="episode_step" if self.multi_episode_enabled else None)
-            
+
+        episode_cap = int(self.episode_max_steps or self.config.env.max_steps) if self.multi_episode_enabled else None
+
         for i in range(len(text_obs)):
-            
+
             available_actions = self.format_avail_actions(infos[i]['available_actions'])
             reformatted_available_actions = "\n".join(f"'{s}'," for s in available_actions)
 
-            if init or self.config.env.history_length <= 0:
-                obs = self.prompt_init.format(
-                    task_description=self.tasks[i],
-                    current_observation=text_obs[i],
-                    available_actions=reformatted_available_actions
-                )
+            if self.multi_episode_enabled:
+                previous_label = self.prev_episode_labels[i]
+                if not previous_label and self.memory and len(self.memory[i]) > 0:
+                    previous_label = self.memory[i][-1].get("episode_label", "")
+                if init or self.config.env.history_length <= 0:
+                    obs = WEBSHOP_TEMPLATE_MULTI_EPISODE_INIT.format(
+                        episode_cap=episode_cap,
+                        task_description=self.tasks[i],
+                        current_observation=text_obs[i],
+                        available_actions=reformatted_available_actions,
+                    )
+                else:
+                    history_text = memory_contexts[i] if memory_contexts is not None else ""
+                    current_ep = self.episode_ids[i] + 1
+                    if self.episode_step_ids[i] == 0:
+                        if not history_text:
+                            if previous_label:
+                                history_text = (
+                                    f"--- Previous episode result: {previous_label} ---\n"
+                                    f"--- Episode {current_ep} start ---"
+                                )
+                            else:
+                                history_text = f"--- Episode {current_ep} start ---"
+                        elif f"Episode {current_ep} start" not in history_text:
+                            history_text = f"{history_text}\n--- Episode {current_ep} start ---"
+                    obs = WEBSHOP_TEMPLATE_MULTI_EPISODE.format(
+                        task_description=self.tasks[i],
+                        step_count=len(self.memory[i]),
+                        history_length=valid_lens[i],
+                        action_history=history_text,
+                        current_episode=current_ep,
+                        current_step=self.episode_step_ids[i] + 1,
+                        current_observation=text_obs[i],
+                        available_actions=reformatted_available_actions,
+                        episode_cap=episode_cap,
+                    )
             else:
-                obs = self.prompt_history.format(
-                    task_description=self.tasks[i],
-                    step_count=len(self.memory[i]),
-                    history_length=valid_lens[i],
-                    action_history=memory_contexts[i],
-                    current_step=len(self.memory[i]) + 1,
-                    current_observation=text_obs[i],
-                    available_actions=reformatted_available_actions
-                )
-                if len(obs) > 13000:
-                    print(f"Warning len(obs)={len(obs)} is too long")
+                if init or self.config.env.history_length <= 0:
                     obs = self.prompt_init.format(
                         task_description=self.tasks[i],
                         current_observation=text_obs[i],
                         available_actions=reformatted_available_actions
                     )
+                else:
+                    obs = self.prompt_history.format(
+                        task_description=self.tasks[i],
+                        step_count=len(self.memory[i]),
+                        history_length=valid_lens[i],
+                        action_history=memory_contexts[i],
+                        current_step=len(self.memory[i]) + 1,
+                        current_observation=text_obs[i],
+                        available_actions=reformatted_available_actions
+                    )
+                    if len(obs) > 13000:
+                        print(f"Warning len(obs)={len(obs)} is too long")
+                        obs = self.prompt_init.format(
+                            task_description=self.tasks[i],
+                            current_observation=text_obs[i],
+                            available_actions=reformatted_available_actions
+                        )
 
             postprocess_text_obs.append(obs)
 
@@ -1140,6 +1562,92 @@ class WebshopEnvironmentManager(EnvironmentManagerBase):
 
             postprocess_text_obs.append(obs)
         return postprocess_text_obs
+
+    # ---- Chat (ORBIT-style multi-turn) helpers ---- #
+
+    def _build_chat_system_prompts(self, batch_size: int) -> List[str]:
+        if self.multi_episode_enabled:
+            episode_cap = int(self.episode_max_steps or self.config.env.max_steps)
+            return [WEBSHOP_CHAT_SYSTEM_PROMPT.format(episode_cap=episode_cap)] * batch_size
+        return [WEBSHOP_CHAT_SYSTEM_PROMPT_SINGLE] * batch_size
+
+    def _build_chat_obs(
+        self,
+        text_obs: List[str],
+        infos: List[Dict[str, Any]],
+        init: bool = False,
+    ) -> List[List[Dict]]:
+        if init:
+            user_texts, raw_obs_list, admissible_strs = [], [], []
+            for i in range(len(text_obs)):
+                available_actions = self.format_avail_actions(infos[i]['available_actions'])
+                reformatted = "\n".join(f"'{s}'," for s in available_actions)
+                user_text = WEBSHOP_CHAT_USER_OBS.format(
+                    task_description=self.tasks[i],
+                    current_observation=text_obs[i],
+                    available_actions=reformatted,
+                )
+                user_texts.append(user_text)
+                raw_obs_list.append(text_obs[i])
+                admissible_strs.append(reformatted)
+
+            self.memory.store({
+                'user_text': user_texts,
+                'assistant_text': [None] * len(text_obs),
+                'raw_obs': raw_obs_list,
+                'admissible_actions': admissible_strs,
+                'episode_id': list(self.episode_ids),
+                'episode_step': list(self.episode_step_ids),
+                'episode_label': list(self.episode_labels),
+            })
+
+        system_prompts = self._build_chat_system_prompts(len(text_obs))
+        return self.memory.build_message_history(system_prompts)
+
+    def _store_chat_record(self, text_obs: List[str], infos: List[Dict[str, Any]], raw_responses: List[str]):
+        user_texts, admissible_strs = [], []
+        for i in range(len(text_obs)):
+            available_actions = self.format_avail_actions(infos[i]['available_actions'])
+            reformatted = "\n".join(f"'{s}'," for s in available_actions)
+            user_text = WEBSHOP_CHAT_USER_OBS.format(
+                task_description=self.tasks[i],
+                current_observation=text_obs[i],
+                available_actions=reformatted,
+            )
+            user_texts.append(user_text)
+            admissible_strs.append(reformatted)
+
+        self.memory.store({
+            'user_text': user_texts,
+            'assistant_text': raw_responses,
+            'raw_obs': list(text_obs),
+            'admissible_actions': admissible_strs,
+            'episode_id': list(self.episode_ids),
+            'episode_step': list(self.episode_step_ids),
+            'episode_label': list(self.episode_labels),
+        })
+
+    def _store_chat_record_partial(self, text_obs: List[str], infos: List[Dict[str, Any]], raw_responses: List[str]):
+        """Store chat records only for envs NOT in reflection-pending state."""
+        for i in range(len(text_obs)):
+            if self._reflection_pending[i]:
+                continue
+            available_actions = self.format_avail_actions(infos[i]['available_actions'])
+            reformatted = "\n".join(f"'{s}'," for s in available_actions)
+            user_text = WEBSHOP_CHAT_USER_OBS.format(
+                task_description=self.tasks[i],
+                current_observation=text_obs[i],
+                available_actions=reformatted,
+            )
+            self.memory.store_single(i, {
+                'user_text': user_text,
+                'assistant_text': raw_responses[i],
+                'raw_obs': text_obs[i],
+                'admissible_actions': reformatted,
+                'episode_id': self.episode_ids[i],
+                'episode_step': self.episode_step_ids[i],
+                'episode_label': self.episode_labels[i],
+            })
 
     def _process_batch(self, batch_idx, total_batch_list, total_infos, success):
         for i in reversed(range(len(total_batch_list[batch_idx]))):

@@ -14,9 +14,14 @@
 
 import logging
 import os
-import pkg_resources
-
-from pkg_resources import DistributionNotFound
+try:
+    import pkg_resources
+    from pkg_resources import DistributionNotFound
+except ImportError:
+    # pkg_resources is only used for NPU hardware checks below;
+    # not needed on GPU (H200) nodes where is_npu_available is False.
+    pkg_resources = None
+    DistributionNotFound = Exception
 from packaging.version import parse as parse_version
 from .protocol import DataProto
 from .utils.logging_utils import set_basic_config

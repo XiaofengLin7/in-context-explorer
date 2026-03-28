@@ -175,6 +175,7 @@ class WebshopMultiProcessEnv(gym.Env):
     def reset(self):
         idx = self._rng.choice(self.goal_idxs, size=self.env_num, replace=False)
         idx = np.repeat(idx, self.group_n).tolist()
+        self._current_goal_idxs = list(idx)
 
         # Send reset commands to all workers
         futures = []
@@ -190,6 +191,21 @@ class WebshopMultiProcessEnv(gym.Env):
             info_list.append(info)
 
         return obs_list, info_list
+
+    def soft_reset(self, indices):
+        """Reset specific workers to the same goal_idx for multi-episode retry."""
+        futures = []
+        for idx in indices:
+            goal_idx = self._current_goal_idxs[idx]
+            futures.append((idx, self._workers[idx].reset.remote(goal_idx)))
+
+        results = ray.get([f for _, f in futures])
+        obs_map, info_map = {}, {}
+        for (idx, _), (obs, info) in zip(futures, results):
+            obs_map[idx] = obs
+            info_map[idx] = info
+
+        return obs_map, info_map
 
     # ------------------------------------------------------------------
     # Convenience helpers ----------------------------------------------

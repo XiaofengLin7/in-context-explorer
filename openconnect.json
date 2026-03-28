@@ -1,0 +1,48 @@
+{
+    "idev": {
+        "registration": {
+            "project": "ice-${USER}-project",
+            "domain": "development",
+            "workflow_src": "src/workflows/workflow.py",
+            "additional_sources": [],
+            "resources": [
+                "."
+            ],
+            "images": [],
+            "crew_id": 12350
+        },
+        "executions": [
+            {
+                "name": "default",
+                "workflow_name": "workflows.workflow.interactive_dev_workflow"
+            }
+        ]
+    },
+    "alfworld_multi_episode": {
+        "registration": {
+            "project": "ice-${USER}-project",
+            "domain": "development",
+            "workflow_src": "src/workflows/workflow.py",
+            "additional_sources": [],
+            "resources": [
+                "."
+            ],
+            "images": [],
+            "crew_id": 12350
+        },
+        "executions": [
+            {
+                "name": "default",
+                "workflow_name": "workflows.workflow.ice_alfworld_multi_episode_workflow"
+            },
+            {
+                "name": "reflection",
+                "workflow_name": "workflows.workflow.ice_alfworld_multi_episode_reflection_workflow"
+            },
+            {
+                "name": "finetuned",
+                "workflow_name": "workflows.workflow.ice_alfworld_multi_episode_finetuned_workflow"
+            }
+        ]
+    }
+}

@@ -65,13 +65,68 @@ Prior to this step, you have already taken {step_count} step(s). Below are the m
 Your known information from the previous step is: <known>{known_information}</known>
 Your unknown information from the previous step is: <unknown>{unknown_information}</unknown>
 You are now at step {current_step} and your current observation is: {current_observation}.
-Your admissible actions of the current situation are: 
+Your admissible actions of the current situation are:
 [
 {available_actions}
 ].
 
 Now it's your turn to take one action for the current step.
-You should reason step-by-step about the current situation before taking an action. This reasoning process MUST be enclosed within <think> </think> tags. 
+You should reason step-by-step about the current situation before taking an action. This reasoning process MUST be enclosed within <think> </think> tags.
 Within your reasoning process, you should first summarize what is known and what is unknown about the current situation. The known MUST be enclosed within <known> </known> tags. The unknown MUST be enclosed within <unknown> </unknown> tags. You MUST include the known and unknown within <think> </think> tags.
 Once you've finished your reasoning, you should choose an admissible action for current step and present it within <action> </action> tags.
 """
+
+# --------------------- WebShop (Multi-Episode) --------------------- #
+WEBSHOP_TEMPLATE_MULTI_EPISODE_INIT = """
+You are an expert autonomous agent operating in the WebShop e-commerce environment. Every episode resets on: success or after {episode_cap} step(s). The task is unchanged across episodes, so you can reuse what you learned from previous episodes.
+Your task is to: {task_description}.
+You are currently in episode 1 and your current observation is: {current_observation}.
+Your admissible actions of the current situation are:
+[
+{available_actions}
+].
+
+Now it's your turn to take one action for the current step.
+You should first reason step-by-step about the current situation, then think carefully which admissible action best advances the shopping goal. This reasoning process MUST be enclosed within <think> </think> tags.
+Once you've finished your reasoning, you should choose an admissible action for the current step and present it within <action> </action> tags.
+"""
+
+WEBSHOP_TEMPLATE_MULTI_EPISODE = """
+You are an expert autonomous agent operating in the WebShop e-commerce environment. Every episode resets on: success or after {episode_cap} step(s). The task is unchanged across episodes, so you can reuse what you learned from previous episodes.
+Your task is to: {task_description}.
+Prior to this step, you have already taken {step_count} step(s). Below are the most recent {history_length} observations and the corresponding actions you took: {action_history}
+You are currently in episode {current_episode} at step {current_step} and your current observation is: {current_observation}.
+Your admissible actions of the current situation are:
+[
+{available_actions}
+].
+
+Now it's your turn to take one action for the current step.
+You should first reason step-by-step about the current situation, then think carefully which admissible action best advances the shopping goal. This reasoning process MUST be enclosed within <think> </think> tags.
+Once you've finished your reasoning, you should choose an admissible action for the current step and present it within <action> </action> tags.
+"""
+
+# --------------------- WebShop (Chat / ORBIT-style) --------------------- #
+WEBSHOP_CHAT_SYSTEM_PROMPT = """You are an expert autonomous agent operating in the WebShop e-commerce environment. Every episode resets on: success or after {episode_cap} step(s). The task is unchanged across episodes, so you can reuse what you learned from previous episodes.
+
+You should first reason step-by-step about the current situation, then think carefully which admissible action best advances the shopping goal. This reasoning process MUST be enclosed within <think> </think> tags.
+Once you've finished your reasoning, you should choose an admissible action for the current step and present it within <action> </action> tags."""
+
+WEBSHOP_CHAT_SYSTEM_PROMPT_SINGLE = """You are an expert autonomous agent operating in the WebShop e-commerce environment.
+
+You should first reason step-by-step about the current situation, then think carefully which admissible action best advances the shopping goal. This reasoning process MUST be enclosed within <think> </think> tags.
+Once you've finished your reasoning, you should choose an admissible action for the current step and present it within <action> </action> tags."""
+
+WEBSHOP_CHAT_USER_OBS = """Your task is to: {task_description}
+Your current observation is: {current_observation}
+Your admissible actions of the current situation are:
+[
+{available_actions}
+]."""
+
+WEBSHOP_CHAT_USER_OBS_STRIPPED = """Your current observation was: {current_observation}"""
+
+WEBSHOP_CHAT_REFLECTION_PROMPT = """[Reflection] The episode has ended. Reflect on the past experience and come up with a new plan of action.
+- First, reason step-by-step about the strategy and path you took to attempt to complete the task. Identify where things went wrong or could be better.
+- Then devise a concise, new plan of action that accounts for your mistake with reference to specific actions that you should have taken.
+- Finally, end the response with your reflection and improved plan inside <remark> </remark> tags, to guide the next trial."""
